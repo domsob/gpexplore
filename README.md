@@ -31,7 +31,7 @@ The first start downloads the Flet desktop client once. On Linux you may also ne
 
 ## Use GPExplore in Python
 
-`gpexplore.py` gives the same runs and experiments as the app. Problems, data sets and custom operators are addressed by the names shown in the app; parameter names are listed by `gpx.parameters()`.
+`gpexplore.py` performs the same runs and experiments as the app. Problems, data sets and custom operators are addressed by the names shown in the app. Parameter names can be listed by `gpx.parameters()`.
 
 ```python
 import gpexplore as gpx
