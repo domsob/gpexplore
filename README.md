@@ -1,73 +1,62 @@
-# GPExplore: A Graphical User Interface for Genetic Programming 
-GPExplore is a GUI application based on Python and Flet that demonstrates the behavior of genetic programming (GP) for symbolic regression. It allows users to experiment with different settings and observe how a GP approach evolves solutions over time.
+# GPExplore
+
+GPExplore is a desktop (and web) application for exploring and teaching genetic programming (GP). It supports symbolic regression, program synthesis and Boolean problems, with live plots of the run and the population, and an experiments mode. Plus: Everything can also be scripted in Python.
+
+![GPExplore: Pagie-1 with ROIDS and 10 % outliers in the training data](gpexplore.gif)
 
 ## Features
-- Interactive GUI for exploring and teaching the GP fundamentals
-- Adjustable settings for population size, mutation rate, crossover rate, and more
-- Real-time visualization of the GP process and results
 
-## User Interface 
+- **Problems**: Regression benchmarks (Koza, Nguyen, Pagie, …), program synthesis (Small or Large, Compare String Lengths, Count Odds), Boolean problems (parity, multiplexer, majority), plus your own: a formula, a Python function, a Boolean expression or an imported data set (CSV, TSV, …).
+- **Runs**: Watch evolution as it happens. While a run makes progress, GPExplore shows how the error drops, how the best individual fits the data and which test cases it solves. You can check its tree representation and ancestry, browse the whole population, or switch to the population dynamics: fitness distribution, tree size, diversity, selection pressure and the effects of crossover and mutation.
+- **Selection**: Tournament, (ε-)lexicase, down-sampled and informed down-sampled (ε-)lexicase, ROIDS, and more.
+- **Parameters**: Everything from population size to crossover type, mutation operator, bloat control, elitism, fitness function and seed.
+- **Your own code**: Custom fitness functions, selection methods, crossover and mutation operators, initialization and bloat control, as well as custom functions for each function set, all written as Python functions in the app (with syntax highlighting).
+- **Experiments**: Compare configurations over many runs with full parallelization. Success rates, median curves, and population dynamics can be analyzed over all runs. The results can bye also exported as PDF report and CSV.
 
-![GPExplore Screenshot](gpexplore_screen.png)
+## Getting Started
 
-## Requirements
-To run GPExplore, you need:
+Python 3.10 – 3.13:
 
-- Python 3.8 or higher (tested with Python 3.10 and 3.12)
-- PIP for installing dependencies
-
-## Installation and Setup
-
-Follow the steps below for your operating system:
-
-### 1. Clone the Repository
 ```bash
 git clone https://github.com/domsob/gpexplore.git
 cd gpexplore
-```
-
-### 2. Create a Virtual Environment
-
-#### Windows 
-```bash
-python -m venv venv
-venv\Scripts\activate
-```
-
-#### Linux / macOS
-```bash
 python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install Dependencies
-#### Windows / macOS / Linux
-```bash
+source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-```
-#### Linux
-May also need to be installed under Linux (tested with Ubuntu Linux):
-```bash
-sudo apt install libmpv-dev libmpv2
-sudo ln -s /usr/lib/x86_64-linux-gnu/libmpv.so /usr/lib/libmpv.so.1
-```
-For details see: https://stackoverflow.com/questions/78007193/error-while-loading-shared-libraries-libmpv-so-1-cannot-open-shared-object-fil
-
-### 4. Run the Application
-```bash
-python main.py
+python main.py                    # desktop app
+python main.py --web              # in the web browser (optional: --port 8550)
 ```
 
-## Troubleshooting
+The first start downloads the Flet desktop client once. On Linux you may also need `sudo apt install libmpv-dev libmpv2`.
 
-On Linux systems, GTK/GDK error messages may appear in the terminal after the application is closed. However, this has no effect on the application's functionality. 
+## Use GPExplore in Python
 
-## Contributing
+`gpexplore.py` gives the same runs and experiments as the app. Problems, data sets and custom operators are addressed by the names shown in the app; parameter names are listed by `gpx.parameters()`.
 
-Contributions are welcome! If you have any ideas or suggestions, please do not hesitate to get in touch.
+```python
+import gpexplore as gpx
+
+if __name__ == "__main__":      # needed because experiments run in several processes
+    # one run
+    result = gpx.run("Pagie-1", selection_method="ROIDS", generations=40, outlier_share=0.1, seed=1)
+    print(result.best_expression, result.best_validation)
+    result.save_plot("pagie.png")                  # also "fit", "tree", "diversity", …; .pdf / .svg
+    print(result.history["best_validation"])       # per generation; result.series has everything
+
+    # an experiment over several problems
+    exp = gpx.Experiment(["Koza-1", "Pagie-1", "Small or Large"], runs=30, seed=1)
+    exp.add("Tournament", selection_method="Tournament")
+    exp.add("Lexicase", selection_method="Lexicase")
+    # exp.add("Mine", selection_method="my_selection")   # a custom operator saved in the app
+    exp.run()
+    print(exp.summary())                           # medians, success rates, pairwise tests
+    exp.to_pdf("report.pdf")
+    exp.to_csv("results.csv")                      # aggregated per generation
+    exp.to_csv("runs.csv", raw=True)               # every value of every run
+```
+
+`gpx.problem_names()` lists all problems, `gpx.gui_settings()` returns the parameters last used in the app (use it as `base=` of `run` or `Experiment`).
 
 ## License
 
-The GPExplore project is licensed under the terms of the Creative Commons license (Attribution-NonCommercial-ShareAlike 4.0 International). For details see *LICENSE.txt*. 
-
-
+Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International, see `LICENSE.txt`.
