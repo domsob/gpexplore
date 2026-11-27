@@ -141,6 +141,7 @@ class ParamSlider:
     In expert mode (set_expert) a number field replaces the slider."""
 
     instances = []
+    editing = None   # the slider whose number field has the keyboard focus (no run shortcuts then)
 
     def __init__(self, label, attr, lo, hi, fmt, divisions=None, on_commit=None, width=None, compact=False):
         self.attr, self.fmt, self.on_commit = attr, fmt, on_commit
@@ -164,7 +165,8 @@ class ParamSlider:
             focused_border_color=S.INK, border_radius=4, keyboard_type=ft.KeyboardType.NUMBER,
             text_style=ft.TextStyle(font_family=S.MONO, size=12.5, color=S.INK),
             content_padding=ft.Padding.symmetric(horizontal=10, vertical=8),
-            on_change=self._typed, on_blur=self._field_done, on_submit=self._field_done)
+            on_change=self._typed, on_focus=self._field_focus, on_blur=self._field_blur,
+            on_submit=self._field_done)
         self.label_text = ft.Text(label, size=13, color=S.INK)
         if compact:
             self.slider_box = ft.Container(self.slider, expand=True)
@@ -211,6 +213,14 @@ class ParamSlider:
         if error is None:
             self._apply(v)
         self.field.update()
+
+    def _field_focus(self, e):
+        ParamSlider.editing = self
+
+    def _field_blur(self, e):
+        if ParamSlider.editing is self:
+            ParamSlider.editing = None
+        return self._field_done(e)
 
     def _field_done(self, e):
         v, error = self._parse(self.field.value)
@@ -1926,7 +1936,11 @@ async def main(page: ft.Page):
         page.update()
 
     async def on_key(e: ft.KeyboardEvent):
-        if e.ctrl or e.meta or e.alt or dialog_state["open"]:
+        # Keyboard events reach the page whatever has the focus: the shortcuts belong to the Run tab
+        # only (typing a space in, say, a configuration name in Experiments must not start a run),
+        # and not while a number is typed into a slider's field.
+        if (e.ctrl or e.meta or e.alt or dialog_state["open"] or current_tab["index"] != 0
+                or ParamSlider.editing is not None):
             return
         if e.key in (" ", "Space"):
             await toggle_play()
@@ -1935,6 +1949,7 @@ async def main(page: ft.Page):
         elif e.key.upper() == "R" and run is not None:
             await reset()
 
+    current_tab = {"index": 0}   # 0 = Run (see tab_changed)
     page.on_keyboard_event = on_key
 
     def show_message(text):
@@ -3668,8 +3683,14 @@ async def main(page: ft.Page):
         border=ft.Border(bottom=ft.BorderSide(1, S.RULE)),
     )
 
+    def tab_changed(e):
+        try:
+            current_tab["index"] = int(e.data)
+        except (TypeError, ValueError):
+            current_tab["index"] = e.control.selected_index
+
     tabs = ft.Tabs(
-        length=5, selected_index=0, animation_duration=0, expand=True,
+        length=5, selected_index=0, animation_duration=0, expand=True, on_change=tab_changed,
         content=ft.Column(
             [header, ft.TabBarView(controls=[run_view, primitives_view, parameters_view,
                                              experiments_view, about_view], expand=True)],
