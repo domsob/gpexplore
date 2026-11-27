@@ -6,11 +6,13 @@ and large exports (PDF reports, raw CSVs of many runs) are slow over the socket.
 export is kept here for a while and offered as an ordinary HTTP download instead.
 """
 
+import os
 import secrets
 import threading
 import time
 from urllib.parse import quote
 
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 KEEP_SECONDS = 15 * 60   # how long an export can be downloaded
 MAX_FILES = 40           # older exports are dropped beyond this
 
@@ -60,7 +62,7 @@ def run(main, port):
     app = flet_fastapi.FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     # before the Flet app, which is mounted at "/" and would answer every other path
     app.add_api_route("/download/{token}/{file_name}", _download, methods=["GET"])
-    app.mount("/", flet_fastapi.app(main))
+    app.mount("/", flet_fastapi.app(main, assets_dir=ASSETS_DIR))   # assets/favicon.png: the tab icon
     url = f"http://127.0.0.1:{port}"
 
     async def serve():

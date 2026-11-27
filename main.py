@@ -18,6 +18,7 @@ import gp
 import plots
 import problems
 import style as S
+import surface_workers
 import operators
 from code_editor import CodeEditor
 import synthesis
@@ -70,6 +71,8 @@ def link_button(icon, label, on_click):
     )
 
 
+# GPX_DRAG_LOG=<file>: timings of each 3D drag (events, frames), for tuning
+DRAG_LOG = [] if os.environ.get("GPX_DRAG_LOG") else None
 HAND = {ft.ControlState.DISABLED: ft.MouseCursor.BASIC, ft.ControlState.DEFAULT: ft.MouseCursor.CLICK}
 
 
@@ -343,6 +346,7 @@ async def main(page: ft.Page):
     page.window.width = max(page.window.min_width, config.window_width)
     page.window.height = max(page.window.min_height, config.window_height)
     page.window.bgcolor = S.PAPER
+    page.window.icon = "icon.ico"   # title bar and taskbar (Windows only; from assets/)
     # The client starts hidden (AppView.FLET_APP_HIDDEN); mirror that here so
     # that setting `visible = True` after centering is sent as a real change.
     page.window.visible = False
@@ -394,7 +398,7 @@ async def main(page: ft.Page):
     plot_sizes = {"error": plots.DEFAULT_SIZE, "fit": plots.DEFAULT_SIZE}
     card_view = {"error": "main", "fit": "main"}   # "main" or a key of plots.DYNAMICS_VIEWS
 
-    def render_card(which, snap, settings, size, angles=None, scale=None):
+    def render_card(which, snap, settings, size, angles=None, scale=None, draft=False):
         """PNG of one plot card in its current view."""
         problem = settings["problem"]
         if card_view[which] != "main":
@@ -404,7 +408,8 @@ async def main(page: ft.Page):
                                            holdout=holdout_name(settings), percent=problem.kind != "sr")
         return plots.render_fit_plot(snap, problem, settings["training_X"], settings["training_y"],
                                      config.plot_adjust, size, angles or view["angles"],
-                                     scale or plots.SCALE, len(settings["validation_y"]), settings["validation_y"])
+                                     scale or plots.SCALE, len(settings["validation_y"]), settings["validation_y"],
+                                     draft=draft)
     render_state = {"dirty": False, "busy": False}
     resize_timer = {"handle": None}
 
@@ -449,7 +454,8 @@ async def main(page: ft.Page):
                 snap = last_snapshot if run is not None else None
                 settings = run.settings if run is not None else config.run_settings()
                 png = await asyncio.to_thread(render_card, "fit", snap, settings, plot_sizes["fit"],
-                                              view["angles"], 1 if fit_state["fast"] else plots.SCALE)
+                                              view["angles"], 1 if fit_state["fast"] else plots.SCALE,
+                                              fit_state["fast"])
                 fit_img.src = png
                 fit_img.update()
         finally:
@@ -465,8 +471,47 @@ async def main(page: ft.Page):
         fit_gesture.mouse_cursor = cursor
         fit_gesture.update()
 
+    # While dragging, frames are rendered in parallel by worker processes (surface_workers);
+    # only a frame newer than the one on screen is shown, and none after the drag has ended
+    # (then the sharp PNG of refresh_fit takes over).
+    drag = {"active": False, "seq": 0, "shown": 0, "inflight": 0, "pending": False}
+
+    async def drag_frame():
+        if not surface_workers.ready():
+            await refresh_fit(fast=True)
+            return
+        if drag["inflight"] >= surface_workers.WORKERS:
+            drag["pending"] = True   # rendered by the next free worker, with the angles of then
+            return
+        drag["seq"] += 1
+        seq = drag["seq"]
+        snap = last_snapshot if run is not None else None
+        settings = run.settings if run is not None else config.run_settings()
+        drag["inflight"] += 1
+        t_submit = time.perf_counter()
+        try:
+            png = await surface_workers.render(snap, settings["problem"], settings["training_X"],
+                                               settings["training_y"], config.plot_adjust, plot_sizes["fit"],
+                                               view["angles"])
+        finally:
+            drag["inflight"] -= 1
+        t_done = time.perf_counter()
+        if png is None:
+            await refresh_fit(fast=True)
+        elif drag["active"] and seq > drag["shown"] and is_3d():
+            drag["shown"] = seq
+            fit_img.src = png
+            fit_img.update()
+            if DRAG_LOG is not None:
+                DRAG_LOG.append(("frame", t_submit, t_done, time.perf_counter(), len(png)))
+        if drag["pending"] and drag["active"]:
+            drag["pending"] = False
+            await drag_frame()
+
     def on_fit_pan_start(e):
         if is_3d():
+            drag["active"], drag["pending"] = True, False
+            surface_workers.start()
             set_fit_cursor(ft.MouseCursor.GRABBING)
 
     async def on_fit_pan_update(e: ft.DragUpdateEvent):
@@ -476,9 +521,18 @@ async def main(page: ft.Page):
         azim -= e.local_delta.x * 0.5
         elev = min(90.0, max(-5.0, elev + e.local_delta.y * 0.4))
         view["angles"] = (elev, azim)
-        await refresh_fit(fast=True)
+        if DRAG_LOG is not None:
+            DRAG_LOG.append(("event", time.perf_counter(), surface_workers.ready(), drag["inflight"]))
+        await drag_frame()
 
     async def on_fit_pan_end(e):
+        drag["active"], drag["pending"] = False, False
+        if DRAG_LOG:
+            with open(os.environ["GPX_DRAG_LOG"], "a") as f:
+                f.write(f"--- drag, size {plot_sizes['fit']}, workers {surface_workers.WORKERS}\n")
+                for row in DRAG_LOG:
+                    f.write(" ".join(f"{v:.4f}" if isinstance(v, float) else str(v) for v in row) + "\n")
+            DRAG_LOG.clear()
         if is_3d():
             set_fit_cursor(ft.MouseCursor.GRAB)
             await refresh_fit(fast=False)
@@ -493,6 +547,8 @@ async def main(page: ft.Page):
                      text_align=ft.TextAlign.RIGHT)
 
     def on_fit_hover(e: ft.HoverEvent):
+        if is_3d():
+            surface_workers.start()   # warm up the 3D renderers before the first drag
         settings = run.settings if run is not None else config.run_settings()
         problem = settings["problem"]
         if problem.kind == "sr" or e.local_position is None or card_view["fit"] != "main":
@@ -3675,4 +3731,4 @@ if __name__ == "__main__":
     if args.web:
         webserver.run(main, args.port)   # the Flet app plus a download route for exports
     else:
-        ft.run(main, view=ft.AppView.FLET_APP_HIDDEN)
+        ft.run(main, view=ft.AppView.FLET_APP_HIDDEN, assets_dir=webserver.ASSETS_DIR)

@@ -12,6 +12,7 @@ import contextlib
 import io
 import math
 import threading
+import types
 from collections import Counter
 
 import matplotlib
@@ -201,9 +202,10 @@ def render_error_plot(snapshot, generations, adjust, size=DEFAULT_SIZE, holdout=
 
 
 def render_fit_plot(snapshot, problem, train_X, train_y, adjust, size=DEFAULT_SIZE,
-                    view=DEFAULT_VIEW, scale=SCALE, test_size=0, test_y=None):
+                    view=DEFAULT_VIEW, scale=SCALE, test_size=0, test_y=None, draft=False):
     """Best individual vs. training data: a curve for one input, a surface for two.
-    `view` (elevation, azimuth) and a lower `scale` are used while the 3D plot is dragged."""
+    `view` (elevation, azimuth), a lower `scale` and `draft` (a JPEG frame) are used while
+    the 3D plot is dragged."""
     n_edge = problem.edge_count(len(train_y)) if problem.kind == "ps" else 0
     with _lock, matplotlib.rc_context(_rc()):
         if problem.kind == "logic":
@@ -213,7 +215,7 @@ def render_fit_plot(snapshot, problem, train_X, train_y, adjust, size=DEFAULT_SI
         if getattr(problem, "dataset", False):
             return _render_predicted(snapshot, train_y, test_y or [], adjust, size)
         if problem.inputs == 2:
-            return _render_surface(snapshot, problem, train_X, train_y, adjust, size, view, scale)
+            return _render_surface(snapshot, problem, train_X, train_y, adjust, size, view, scale, draft)
         fig, ax = _figure(*size, MARGIN_LEFT_FIT)
         xs = np.array([row[0] for row in train_X])
         ys = np.asarray(train_y, dtype=float)
@@ -561,13 +563,76 @@ def _downsample(snapshot):
     return np.asarray(snapshot.downsample, dtype=int)
 
 
-def _render_surface(snapshot, problem, train_X, train_y, adjust, size, view, scale):
+# The last 3D figure, reused while it is rotated: building it (axes, ticks, surface,
+# legend) costs about as much as drawing it, so a drag only changes the view and redraws.
+# The key holds the objects themselves (not their ids), so an id can't be reused for other data.
+_surface_cache = {"key": None, "fig": None}
+
+
+def _render_surface(snapshot, problem, train_X, train_y, adjust, size, view, scale, draft=False):
+    cacheable = getattr(_output, "fmt", "png") == "png" and not getattr(_output, "white", False)
+    key = (snapshot, problem, train_X, train_y, bool(adjust), tuple(int(v) for v in size))
+    cached = _surface_cache["key"]
+    if cacheable and cached is not None and len(cached) == len(key) and all(a is b or (
+            type(a) in (bool, tuple) and a == b) for a, b in zip(cached, key)):
+        fig = _surface_cache["fig"]
+    else:
+        fig = _build_surface(snapshot, problem, train_X, train_y, adjust, size)
+        if cacheable:
+            _surface_cache["key"], _surface_cache["fig"] = key, fig
+    fig.axes[0].view_init(elev=view[0], azim=view[1])
+    if draft and cacheable:
+        # While dragging: JPEG encodes several times faster than PNG and the frame is replaced
+        # by a sharp PNG as soon as the drag ends.
+        buf = io.BytesIO()
+        fig.savefig(buf, format="jpg", dpi=100 * scale, facecolor=_panel(), pil_kwargs={"quality": 90})
+        return buf.getvalue()
+    return _png(fig, scale)
+
+
+def surface_payload(snapshot, problem, train_X, train_y, adjust, size):
+    """What a worker process needs to build the 3D plot: picklable, without the population."""
+    snap = None
+    if snapshot is not None:
+        snap = types.SimpleNamespace(best_prediction=snapshot.best_prediction,
+                                     downsample=snapshot.downsample, outliers=snapshot.outliers)
+    return (snap, problem, np.asarray(train_X, dtype=float), np.asarray(train_y, dtype=float),
+            bool(adjust), tuple(int(v) for v in size))
+
+
+_frame_cache = {"token": None, "fig": None}
+
+
+def render_surface_frame(token, payload, view, scale=1):
+    """In a worker process (see surface_workers): one JPEG frame of the rotating 3D plot.
+    The figure is built once per `token` (one state of the plot) and then only turned."""
+    with _lock, matplotlib.rc_context(_rc()):
+        if _frame_cache["token"] != token:
+            _frame_cache["fig"], _frame_cache["token"] = None, None
+            _frame_cache["fig"] = _build_surface(*payload)
+            _frame_cache["token"] = token
+        fig = _frame_cache["fig"]
+        fig.axes[0].view_init(elev=view[0], azim=view[1])
+        buf = io.BytesIO()
+        fig.savefig(buf, format="jpg", dpi=100 * scale, facecolor=_panel(), pil_kwargs={"quality": 90})
+        return buf.getvalue()
+
+
+def warm_up():
+    """In a worker process: load fonts and the 3D machinery once, before the first frame."""
+    problem = problems.Problem("x*y", 2)
+    payload = surface_payload(None, problem, [[0.0, 0.0]], [0.0], True, DEFAULT_SIZE)
+    render_surface_frame("warm-up", payload, DEFAULT_VIEW)
+    _frame_cache["token"], _frame_cache["fig"] = None, None
+    return True
+
+
+def _build_surface(snapshot, problem, train_X, train_y, adjust, size):
     width, height = max(int(size[0]), 240), max(int(size[1]), 180)
     fig = Figure(figsize=(width / 100, height / 100), dpi=100, facecolor=_panel())
     # The 3D axes fill the figure; its own box is fixed by the view, so frames stay aligned.
     ax = fig.add_axes((-0.04, -0.01, 0.94, 1.04), projection="3d", facecolor=_panel(),
                       computed_zorder=False)  # draw order below: wireframe, surface, points
-    ax.view_init(elev=view[0], azim=view[1])
     ax.set_box_aspect(None, zoom=0.98)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis.set_pane_color(matplotlib.colors.to_rgba(style.PAPER, 0.6))
@@ -622,7 +687,7 @@ def _render_surface(snapshot, problem, train_X, train_y, adjust, size, view, sca
     leg = fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.01, 0.99))
     for text in leg.get_texts():
         text.set_color(style.INK)
-    return _png(fig, scale)
+    return fig
 
 
 # --------------------------------------------------------------------------
