@@ -13,6 +13,7 @@ import clipboard_image
 import config
 import datasets
 import experiments
+import fast
 import gp
 import plots
 import problems
@@ -20,6 +21,7 @@ import style as S
 import operators
 from code_editor import CodeEditor
 import synthesis
+import webserver
 
 warnings.filterwarnings("ignore")
 
@@ -121,10 +123,12 @@ HARD_LIMITS = {
     "training_set_size": (1, None), "noise_intensity": (0.0, None), "outlier_share": (0.0, 1.0),
     "validation_set_size": (1, None), "generations": (1, None), "population_size": (1, None),
     "crossover_probability": (0.0, 1.0), "mutation_probability": (0.0, 1.0), "tourn_size": (1, None),
+    "parsimony_size": (1.0, 2.0), "lexicase_epsilon": (0.0, None),
     "ds_rate": (0.0, 1.0), "parent_sampling_rate": (0.0, 1.0), "distance_interval": (1, None),
     "outlier_rate": (0.0, 1.0), "min_initial_tree_depth": (0, None), "max_initial_tree_depth": (1, None),
-    "max_tree_depth": (1, 90),   # deeper trees exceed Python's recursion limit when compiled
+    "max_tree_depth": (1, gp.MAX_DEPTH),
     "inter_gen_pause": (0.0, None), "max_tree_size": (1, None), "elitism": (0, None),
+    "inner_node_probability": (0.0, 1.0), "subtree_min_depth": (0, 90), "subtree_max_depth": (0, 90),
     "exp_runs": (2, None), "exp_workers": (1, None),
 }
 
@@ -144,6 +148,7 @@ class ParamSlider:
         self.hard = HARD_LIMITS.get(attr, (None, None))
         self.range = [lo, hi]   # the slider's range; only a problem's own sizes may widen it (see set)
         self.expert = False
+        self.last_committed = value   # on_commit only fires when the value really changed
         self.value_text = mono(fmt(value), size=12.5, text_align=ft.TextAlign.RIGHT)
         self.slider = ft.Slider(
             min=lo, max=hi, value=min(max(value, lo), hi), divisions=divisions if divisions else int(hi - lo),
@@ -206,8 +211,19 @@ class ParamSlider:
 
     def _field_done(self, e):
         v, error = self._parse(self.field.value)
-        if error is None and self.on_commit:
+        if error is None:
+            return self._commit()
+
+    def _commit(self):
+        """on_commit if the value changed since the last commit (leaving a field or letting go of the
+        slider without a change must not, e.g., draw new training data)."""
+        value = getattr(config, self.attr)
+        if value == self.last_committed:
+            return None
+        self.last_committed = value
+        if self.on_commit:
             return self.on_commit()
+        return None
 
     def clamp(self):
         """Leaving expert mode: a value outside the slider's range becomes its minimum or maximum.
@@ -220,6 +236,7 @@ class ParamSlider:
         self.value_text.value = self.fmt(clamped)
         if clamped != value:
             setattr(config, self.attr, clamped)
+            self.last_committed = clamped
             return True
         return False
 
@@ -249,6 +266,7 @@ class ParamSlider:
         self.slider.min, self.slider.max = self.range
         self.slider.value = min(max(value, self.range[0]), self.range[1])
         setattr(config, self.attr, value)
+        self.last_committed = value
         self.value_text.value = self.fmt(value)
         self.field.value = self._text(value)
         self.field.error = None
@@ -260,8 +278,7 @@ class ParamSlider:
 
     def _committed(self, e):
         self._changed(e)
-        if self.on_commit:
-            return self.on_commit()
+        return self._commit()
 
     @property
     def disabled(self):
@@ -269,7 +286,7 @@ class ParamSlider:
 
     @disabled.setter
     def disabled(self, flag):
-        self.slider.disabled = flag
+        self.slider.disabled = self.field.disabled = flag
         self.field.disabled = flag
         self.value_text.color = S.FAINT if flag else S.INK
         self.field.text_style = ft.TextStyle(font_family=S.MONO, size=12.5, color=S.FAINT if flag else S.INK)
@@ -320,10 +337,11 @@ async def main(page: ft.Page):
         tooltip_theme=ft.TooltipTheme(text_style=ft.TextStyle(size=11, color=S.PANEL),
                                       decoration=ft.BoxDecoration(bgcolor=S.INK, border_radius=3)),
     )
-    page.window.width = 1400
-    page.window.height = 900
     page.window.min_width = 1100
     page.window.min_height = 720
+    # size of the last session (its normal size, also when it ended maximized or in full screen)
+    page.window.width = max(page.window.min_width, config.window_width)
+    page.window.height = max(page.window.min_height, config.window_height)
     page.window.bgcolor = S.PAPER
     # The client starts hidden (AppView.FLET_APP_HIDDEN); mirror that here so
     # that setting `visible = True` after centering is sent as a real change.
@@ -331,6 +349,9 @@ async def main(page: ft.Page):
     page.update()
 
     run: gp.GPRun | None = None
+    # Inputs are locked only while a run is running or paused: a finished run keeps showing its own
+    # settings (run.settings), and "Run again" starts with the current ones.
+    run_state = {"locked": False}
     last_snapshot: gp.Snapshot | None = None
     render_lock = asyncio.Lock()
 
@@ -639,6 +660,8 @@ async def main(page: ft.Page):
             logic_switches[flag].value = flag in flags
 
     async def select_problem(expression):
+        if run is not None and not run_state["locked"]:
+            await reset()   # the finished run belongs to the previous problem
         config.target_function = expression
         target_dropdown.value = expression
         problem = current_problem()
@@ -1054,7 +1077,7 @@ async def main(page: ft.Page):
 
     custom_btn = link_button(ft.Icons.ADD, "Custom problem", open_custom_dialog)
 
-    # Toast: a small message bar over the plots (never over the run buttons).
+    # Toast: a small message bar, centred at the bottom of the window.
     # Flutter cannot update a SnackBar once shown, so the countdown needs our own bar.
     toast_label = ft.Text("", color=S.PANEL, font_family=S.MONO, size=13, max_lines=1,
                           overflow=ft.TextOverflow.ELLIPSIS, expand=True)
@@ -1065,7 +1088,7 @@ async def main(page: ft.Page):
                              bgcolor=S.INK, border_radius=4, width=520, height=46,
                              padding=ft.Padding.only(left=16, right=6, top=0, bottom=0))],
                alignment=ft.MainAxisAlignment.CENTER),
-        left=340, right=0, bottom=28, visible=False,
+        left=0, right=0, bottom=28, visible=False,
     )
     page.overlay.append(toast_layer)
     toast_state = {"token": 0}
@@ -1191,6 +1214,24 @@ async def main(page: ft.Page):
 
     W = 300
     s_tourn = ParamSlider("", "tourn_size", 2, 9, lambda v: f"{int(v)}", width=W, compact=True)
+    s_parsimony = ParamSlider("", "parsimony_size", 1.0, 2.0, lambda v: f"{v:.2f}", divisions=20, width=W, compact=True)
+    s_eps = ParamSlider("", "lexicase_epsilon", 0.0, 1.0, lambda v: f"{v:.2f}", divisions=100, width=W, compact=True)
+
+    def changed_dt_order(e):
+        config.double_tournament_order = dt_order_dd.value
+
+    dt_order_dd = small_dropdown(config.double_tournament_order,
+                                 [(o, o) for o in operators.OPTIONS["double_tournament_order"]], changed_dt_order)
+    dt_order_dd.width = 326
+
+    def changed_downsampling(e):
+        config.downsampling = downsampling_dd.value
+        sync_selection_controls()
+        sync_problem_views()
+
+    downsampling_dd = small_dropdown(config.downsampling, [(o, o) for o in operators.OPTIONS["downsampling"]],
+                                     changed_downsampling)
+    downsampling_dd.width = 326
     s_ds = ParamSlider("", "ds_rate", 0.01, 0.5, lambda v: f"{v:.2f}", divisions=49, width=W, compact=True)
     s_rho = ParamSlider("", "parent_sampling_rate", 0.01, 0.2, lambda v: f"{v:.2f}", divisions=19, width=W, compact=True)
     s_k = ParamSlider("", "distance_interval", 1, 50, lambda v: f"{int(v)}", width=W, compact=True)
@@ -1200,27 +1241,44 @@ async def main(page: ft.Page):
     s_max_tree = ParamSlider("", "max_tree_depth", 10, 30, lambda v: f"{int(v)}", width=W, compact=True)
     s_pause = ParamSlider("", "inter_gen_pause", 0.0, 5.0, lambda v: f"{v:.1f}s", divisions=50, width=W, compact=True)
 
+    def adaptive():
+        """An adaptive control may switch operators during the run: then all their parameters count."""
+        return config.parameter_control != "None"
+
     def sync_selection_controls(locked=None):
-        """Only the parameters of the chosen selection method are editable."""
-        locked = run is not None if locked is None else locked
+        """Only the parameters of the chosen selection method are editable (all of them with an
+        adaptive control, which may switch the method)."""
+        locked = run_state["locked"] if locked is None else locked
         method = config.selection_method
-        s_tourn.disabled = locked or method not in ("Tournament", "ROIDS")
-        s_ds.disabled = locked or method not in gp.DOWNSAMPLED_METHODS
-        s_rho.disabled = s_k.disabled = locked or method not in gp.INFORMED_METHODS
-        s_gamma.disabled = locked or method != "ROIDS"
+        free = adaptive()
+        s_tourn.disabled = locked or not (free or method in ("Tournament", "Double tournament", "ROIDS"))
+        s_parsimony.disabled = dt_order_dd.disabled = locked or not (free or method == "Double tournament")
+        s_eps.disabled = locked or not (free or method == "Fixed Epsilon-Lexicase")
+        own = method in gp.DOWNSAMPLED_METHODS          # methods with a down-sampling of their own
+        can = not own and method != "Random"            # the others may use the down-sampling setting
+        extra = can and config.downsampling != "None"
+        downsampling_dd.disabled = locked or not (free or can)
+        s_ds.disabled = locked or not (free or own or extra)
+        s_rho.disabled = s_k.disabled = locked or not (
+            free or method in gp.INFORMED_METHODS or (extra and config.downsampling == "Informed"))
+        s_gamma.disabled = locked or not (free or method == "ROIDS")
 
     # advanced parameters (shown with the "Advanced" switch)
     def changed_advanced(e=None):
         config.crossover_type = crossover_dd.value
         config.mutation_type = mutation_dd.value
+        config.subtree_method = subtree_dd.value
+        config.ephemeral_mode = ephemeral_dd.value
         config.bloat_control = bloat_dd.value
         config.fitness_function = fitness_dd.value
+        config.parameter_control = control_dd.value
         sync_operator_buttons()
         try:
             config.seed = max(0, int(seed_field.value or 0))
             seed_field.error = None
         except ValueError:
             seed_field.error = "whole number, 0 = random"
+        sync_selection_controls()
         sync_advanced_controls()
         sync_problem_views()
 
@@ -1231,6 +1289,25 @@ async def main(page: ft.Page):
     mutation_dd = adv_dropdown(config.mutation_type, gp.MUTATIONS)
     bloat_dd = adv_dropdown(config.bloat_control, gp.BLOAT_CONTROLS)
     fitness_dd = adv_dropdown(config.fitness_function, gp.FITNESS_FUNCTIONS)
+    control_dd = adv_dropdown(config.parameter_control, operators.BUILTIN["control"])
+    subtree_dd = adv_dropdown(config.subtree_method, operators.OPTIONS["subtree_method"])
+    ephemeral_dd = adv_dropdown(config.ephemeral_mode, operators.OPTIONS["ephemeral_mode"])
+    subtree_dd.width = ephemeral_dd.width = 326   # as wide as the operator dropdowns above and below
+
+    def subtree_commit(changed):
+        """Keep the minimum depth of new subtrees at most the maximum."""
+        def commit():
+            if s_sub_min.value > s_sub_max.value:
+                other = s_sub_max if changed is s_sub_min else s_sub_min
+                other.set(changed.value)
+                other.control.update()
+        return commit
+
+    s_inner = ParamSlider("", "inner_node_probability", 0.0, 1.0, lambda v: f"{v:.2f}", divisions=100, width=W,
+                          compact=True)
+    s_sub_min = ParamSlider("", "subtree_min_depth", 0, 8, lambda v: f"{int(v)}", width=190, compact=True)
+    s_sub_max = ParamSlider("", "subtree_max_depth", 0, 8, lambda v: f"{int(v)}", width=190, compact=True)
+    s_sub_min.on_commit, s_sub_max.on_commit = subtree_commit(s_sub_min), subtree_commit(s_sub_max)
     s_size = ParamSlider("", "max_tree_size", 10, 300, lambda v: f"{int(v)}", width=W, compact=True)
     s_elite = ParamSlider("", "elitism", 0, 10, lambda v: f"{int(v)}", width=W, compact=True)
     s_erc_lo = ParamSlider("", "erc_lo", -10, 0, lambda v: f"{int(v)}", width=190, compact=True)
@@ -1239,20 +1316,38 @@ async def main(page: ft.Page):
                               focused_border_color=S.INK, border_radius=4, on_change=changed_advanced,
                               text_style=ft.TextStyle(font_family=S.MONO, size=13, color=S.INK),
                               hint_text="0 = random", keyboard_type=ft.KeyboardType.NUMBER)
-    advanced_controls = [crossover_dd, mutation_dd, bloat_dd, fitness_dd, s_size, s_elite, s_erc_lo, s_erc_hi,
+    def changed_numba(e):
+        config.numba_acceleration = bool(numba_switch.value)
+
+    numba_switch = ft.Switch(value=config.numba_acceleration and fast.AVAILABLE, on_change=changed_numba,
+                             disabled=not fast.AVAILABLE)
+    def changed_deep(e):
+        config.deep_acceleration = bool(deep_switch.value)
+
+    deep_switch = ft.Switch(value=config.deep_acceleration, on_change=changed_deep)
+    advanced_controls = [numba_switch, deep_switch, crossover_dd, mutation_dd, s_inner, s_sub_min, s_sub_max, subtree_dd, ephemeral_dd,
+                         bloat_dd, fitness_dd, control_dd, s_size, s_elite, s_erc_lo, s_erc_hi,
                          seed_field]
 
     def sync_advanced_controls():
-        locked = run is not None
+        locked = run_state["locked"]
         sr = current_problem().kind == "sr"
-        s_size.disabled = locked or config.bloat_control != "Depth + size limit"
+        free = adaptive()   # the operators may change during the run
+        mutation = config.mutation_type
+        new_subtrees = mutation in ("Uniform (subtree)", "Mixed") or mutation not in operators.BUILTIN["mutation"]
+        s_inner.disabled = locked or not (free or config.crossover_type == "Leaf-biased")
+        s_sub_min.disabled = s_sub_max.disabled = subtree_dd.disabled = locked or not (free or new_subtrees)
+        ephemeral_dd.disabled = locked or not (free or mutation in ("Ephemeral constants", "Mixed"))
+        s_size.disabled = locked or not (free or config.bloat_control == "Depth + size limit")
+        numba_switch.disabled = locked or not fast.AVAILABLE
         fitness_dd.disabled = locked or not sr
         s_erc_lo.disabled = s_erc_hi.disabled = locked or not sr
 
     # ---- custom operators (Python functions) ----------------------------------
 
     operator_dropdowns = {"fitness": fitness_dd, "selection": selection_dropdown, "crossover": crossover_dd,
-                          "mutation": mutation_dd, "initialization": init_dropdown, "bloat": bloat_dd}
+                          "mutation": mutation_dd, "initialization": init_dropdown, "bloat": bloat_dd,
+                          "control": control_dd}
 
     def refresh_operator_options():
         """Built-in choices plus the saved custom operators in every operator dropdown."""
@@ -1276,7 +1371,7 @@ async def main(page: ft.Page):
         save(key, code) -> name; on_saved(key, name)."""
         state = {"kind": kind}
         editor = CodeEditor(code if code is not None else templates[kind], lines=15, label="Python function",
-                            width=780)
+                            width=900)
         info = ft.Text("", size=13, color=S.INK, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
         saved_dd = ft.Dropdown(label="Open a saved one to edit it", dense=True, filled=True, fill_color=S.PANEL,
                                border_color=S.RULE, focused_border_color=S.INK, border_radius=4,
@@ -1340,11 +1435,12 @@ async def main(page: ft.Page):
             save(key, code_)
             page.pop_dialog()
             on_saved(key, name)
-            toast(f"{noun or dict(kinds)[key]} '{name}' {'saved' if replaced else 'added'}", seconds=4)
+            what = noun.get(key) if isinstance(noun, dict) else (noun or dict(kinds)[key])
+            toast(f"{what} '{name}' {'saved' if replaced else 'added'}", seconds=4)
             page.update()
 
         kind_seg = ft.SegmentedButton(
-            segments=[ft.Segment(value=k, label=ft.Text(label)) for k, label in kinds],
+            segments=[ft.Segment(value=k, label=ft.Text(label, size=13, no_wrap=True)) for k, label in kinds],
             selected=[kind], on_change=switch_kind, show_selected_icon=False,
             style=ft.ButtonStyle(color={ft.ControlState.SELECTED: "#FFFFFF", ft.ControlState.DEFAULT: S.INK},
                                  bgcolor={ft.ControlState.SELECTED: S.INK, ft.ControlState.DEFAULT: S.PANEL},
@@ -1359,7 +1455,7 @@ async def main(page: ft.Page):
             title=ft.Text(title, size=18, weight=ft.FontWeight.W_600, color=S.INK),
             content=ft.Column([kind_seg, saved_dd, editor.control,
                                ft.Container(info, height=40, alignment=ft.Alignment.TOP_LEFT)],
-                              tight=True, spacing=14, width=780, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
+                              tight=True, spacing=14, width=900, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             scrollable=True,
             actions=[ft.TextButton("Cancel", on_click=lambda _: page.pop_dialog(), style=ft.ButtonStyle(color=S.INK)),
                      save_btn],
@@ -1367,7 +1463,7 @@ async def main(page: ft.Page):
         )
         page.show_dialog(dialog)
 
-    OPERATOR_KINDS = [(k.key, k.title.replace(" function", "")) for k in operators.KINDS.values()]
+    OPERATOR_KINDS = [(k.key, k.label or k.title.replace(" function", "")) for k in operators.KINDS.values()]
 
     def check_operator(kind, code):
         name = operators.check(kind, code)
@@ -1376,7 +1472,7 @@ async def main(page: ft.Page):
     def operator_saved(kind, name):
         setattr(config, operators.KINDS[kind].setting, name)
         refresh_operator_options()
-        if kind in ("fitness", "crossover", "mutation", "bloat"):   # these are advanced parameters
+        if kind in ("fitness", "crossover", "mutation", "bloat", "control"):   # these are advanced parameters
             advanced_switch.value = advanced_card.visible = True
         sync_selection_controls()
         sync_advanced_controls()
@@ -1386,7 +1482,8 @@ async def main(page: ft.Page):
         open_code_dialog("Add or edit a custom operator", OPERATOR_KINDS, kind, operators.REGISTRY,
                          operators.TEMPLATES, check_operator,
                          lambda k, c: operators.smoke_test(k, c, config.run_settings()),
-                         operators.add, operator_saved, code)
+                         operators.add, operator_saved, code,
+                         noun={k.key: k.title for k in operators.KINDS.values()})
 
     # edit / delete icons next to each operator dropdown (shown while a custom operator is chosen)
     operator_buttons = {}
@@ -1442,7 +1539,7 @@ async def main(page: ft.Page):
         for kind, (edit_btn, trash_btn) in operator_buttons.items():
             custom = operators.is_custom(kind, getattr(config, operators.KINDS[kind].setting))
             edit_btn.visible = trash_btn.visible = custom
-            edit_btn.disabled = trash_btn.disabled = run is not None
+            edit_btn.disabled = trash_btn.disabled = run_state["locked"]
 
     operator_btn = link_button(ft.Icons.EDIT_NOTE, "Add / edit custom operators", open_operator_dialog)
     refresh_operator_options()
@@ -1690,15 +1787,15 @@ async def main(page: ft.Page):
         step_btn.disabled = state not in ("idle", "paused")
         reset_btn.disabled = state == "idle"
 
-        locked = state != "idle"
+        locked = run_state["locked"] = state in ("running", "paused")
         for c in run_locked:
             c.disabled = locked
         sync_selection_controls(locked)
         sync_advanced_controls()
         sync_operator_buttons()
-        if function_lock["locked"] != (run is not None):   # apply_state runs every generation: rebuild only on change
+        if function_lock["locked"] != run_state["locked"]:   # apply_state runs every generation: rebuild only on change
             rebuild_function_rows()
-        function_btn.disabled = settings_reset_btn.disabled = run is not None
+        function_btn.disabled = settings_reset_btn.disabled = run_state["locked"]
         sync_problem_views()
         tree_btn.disabled = pop_btn.disabled = last_snapshot is None or not last_snapshot.best_nodes
         gen_slider.disabled = run is None
@@ -1853,6 +1950,22 @@ async def main(page: ft.Page):
 
     clipboard = ft.Clipboard()
     file_picker = ft.FilePicker()
+    url_launcher = ft.UrlLauncher()
+
+    async def save_bytes(data, title, file_name, ext):
+        """Save an export: a save dialog on the desktop, a normal download in the browser."""
+        try:
+            if page.web:
+                await url_launcher.launch_url(webserver.offer(data, file_name), web_only_window_name="_self")
+                toast(f"Downloading  {file_name}", seconds=4)
+                return
+            path = await file_picker.save_file(dialog_title=title, file_name=file_name,
+                                               file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=[ext],
+                                               src_bytes=data)
+            if path:
+                toast(f"Saved  {os.path.basename(path)}", seconds=4)
+        except Exception as exc:
+            toast(f"Could not save the file: {exc}", seconds=5)
 
     def plot_file_name(which, ext):
         if which.startswith("exp_"):
@@ -1895,11 +2008,7 @@ async def main(page: ft.Page):
                 return
             fmt = "png" if index == 1 else "pdf"
             data = await asyncio.to_thread(render_for_export, which, fmt)
-            path = await file_picker.save_file(
-                dialog_title=f"Save plot as {fmt.upper()}", file_name=plot_file_name(which, fmt),
-                file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=[fmt], src_bytes=data)
-            if path:
-                toast(f"Saved  {os.path.basename(path)}", seconds=4)
+            await save_bytes(data, f"Save plot as {fmt.upper()}", plot_file_name(which, fmt), fmt)
         except Exception as exc:  # e.g. clipboard not available on this platform
             toast(f"Could not export the plot: {exc}", seconds=5)
 
@@ -1945,7 +2054,7 @@ async def main(page: ft.Page):
         """Grey out switches that have no effect on the selected problem (e.g. sin and cos
         for a Boolean problem) and say so in the section title."""
         usable = gp.applicable_flags(config.run_settings())
-        locked = run is not None
+        locked = run_state["locked"]
         groups = {"sr": switches, "ps": ps_switches, "logic": logic_switches}
         for key, group in groups.items():
             for flag, switch in group.items():
@@ -1982,7 +2091,7 @@ async def main(page: ft.Page):
             logic_signature.value = (f"{', '.join(problem.arg_names)} → output   ({problem.train_size} rows)"
                                      if logic else "—")
         else:
-            s_train.disabled = s_val.disabled = run is not None
+            s_train.disabled = s_val.disabled = run_state["locked"]
             logic_signature.value = "—"
         if ps and not logic:
             # noise and outliers only make sense for numeric regression targets
@@ -1996,7 +2105,7 @@ async def main(page: ft.Page):
             s_noise.disabled = s_outl.disabled = True
             ps_signature.value = "—"
         else:
-            s_noise.disabled = s_outl.disabled = run is not None or dataset
+            s_noise.disabled = s_outl.disabled = run_state["locked"] or dataset
             ps_signature.value = "—"
 
     plots_row = side_by_side(plot_card(error_title, error_img, "error"),
@@ -2012,7 +2121,7 @@ async def main(page: ft.Page):
             ],
             spacing=8,
         ),
-        padding=ft.Padding.only(left=16, right=12, top=10, bottom=14), height=230,
+        padding=ft.Padding.only(left=16, right=12, top=10, bottom=14), height=308,
     )
 
     def resize_expression(dy):
@@ -2202,7 +2311,7 @@ async def main(page: ft.Page):
     function_lock = {"locked": None}
 
     def rebuild_function_rows():
-        locked = run is not None
+        locked = run_state["locked"]
         function_lock["locked"] = locked
         for area, column in function_rows.items():
             rows = []
@@ -2296,30 +2405,6 @@ async def main(page: ft.Page):
         padding=ft.Padding.only(left=32, right=32, top=24, bottom=24), expand=True,
     )
 
-    advanced_card = card(ft.Column([
-        list_header("Advanced parameter", "Scope", "Description", "Value"),
-        list_row("Crossover", "GP", "One-point subtree crossover; leaf-biased picks inner nodes with 90 % "
-                 "probability (Koza).", operator_control("crossover"), name_mono=False),
-        list_row("Mutation", "GP", "Uniform: new random subtree; node replacement: one node by one of the same "
-                 "arity; shrink: subtree by one of its own subtrees; ephemeral: change one constant; mixed: "
-                 "one of these at random.", operator_control("mutation"), name_mono=False),
-        list_row("Bloat control", "GP", "Depth limit (always), additionally a size limit, or lexicographic "
-                 "parsimony: equal fitness → smaller tree wins tournaments.", operator_control("bloat"), name_mono=False),
-        list_row("Max. tree size", "GP", "Maximum number of nodes (with the size limit).", s_size.control,
-                 name_mono=False),
-        list_row("Elitism", "GP", "Best individuals copied unchanged into the next generation.", s_elite.control,
-                 name_mono=False),
-        list_row("Fitness function", "GP", "Symbolic regression only. Linear scaling (Keijzer 2003) fits "
-                 "a + b·f(x) to the data before measuring the error.", operator_control("fitness"), name_mono=False),
-        list_row("Random constants", "GP", "Symbolic regression only: range of the integer random constants "
-                 "(ERC).", ft.Row([s_erc_lo.control, s_erc_hi.control], spacing=10), name_mono=False),
-        list_row("Random seed", "GP", "Same seed and settings give the same run; 0 = a new random run each time.",
-                 seed_field, name_mono=False),
-    ], spacing=0), padding=0)
-    advanced_card.visible = config.show_advanced
-
-    advanced_switch = ft.Switch(value=config.show_advanced)
-
     async def toggle_expert(e):
         """All sliders (also in the sidebar and the Experiments tab) become free number fields; leaving
         expert mode puts values outside a slider's range to its minimum or maximum."""
@@ -2337,9 +2422,65 @@ async def main(page: ft.Page):
 
     expert_switch = ft.Switch(value=config.expert_mode, on_change=toggle_expert)
 
-    def toggle_advanced(e):
+    advanced_card = card(ft.Column([
+        list_header("Advanced parameter", "Scope", "Description", "Value"),
+        list_row("Parsimony size", "GP", "Double tournament: the smaller of two individuals wins with "
+                 "probability size / 2.",
+                 s_parsimony.control, name_mono=False),
+        list_row("Tournament order", "GP", "Double tournament: which of the two tournaments comes first.", dt_order_dd, name_mono=False),
+        list_row("Fixed ε", "GP", "Error tolerance per case (ε-lexicase with fixed ε).", s_eps.control, name_mono=False),
+        list_row("Parent sampling rate s", "GP", "Share of the population used to measure distances "
+                 "between training cases (informed down-sampling and ROIDS).", s_rho.control, name_mono=False),
+        list_row("Distance interval k", "GP", "Generations between two updates of the case distances "
+                 "(informed down-sampling and ROIDS).", s_k.control, name_mono=False),
+        list_row("Crossover", "GP", "One-point subtree crossover; leaf-biased picks the crossover point "
+                 "among the inner nodes with the probability below (Koza).", operator_control("crossover"),
+                 name_mono=False),
+        list_row("Inner-node probability", "GP", "Leaf-biased crossover: probability that the crossover point "
+                 "is an inner node rather than a leaf (Koza: 0.9).", s_inner.control, name_mono=False),
+        list_row("Mutation", "GP", "Uniform: new random subtree; node replacement: one node by one of the same "
+                 "arity; shrink: subtree by one of its own subtrees; ephemeral: change constants; mixed: "
+                 "one of these at random.", operator_control("mutation"), name_mono=False),
+        list_row("New subtree depth", "GP", "Uniform mutation (and random_subtree of custom mutations): "
+                 "minimum and maximum depth of the new subtree.",
+                 ft.Row([s_sub_min.control, s_sub_max.control], spacing=10), name_mono=False),
+        list_row("New subtree method", "GP", "How the new subtree is built: full (all leaves at the drawn "
+                 "depth), grow (leaves at any depth) or ramped half-and-half (either, at random).", subtree_dd,
+                 name_mono=False),
+        list_row("Ephemeral mutation", "GP", "Ephemeral mutation: replaces one random constant of the tree "
+                 "or all of them by new random values.", ephemeral_dd, name_mono=False),
+        list_row("Fitness function", "GP", "Symbolic regression only. Linear scaling (Keijzer 2003) fits "
+                 "a + b·f(x) to the data before measuring the error.", operator_control("fitness"), name_mono=False),
+        list_row("Random constants", "GP", "Symbolic regression only: range of the integer random constants "
+                 "(ERC).", ft.Row([s_erc_lo.control, s_erc_hi.control], spacing=10), name_mono=False),
+        list_row("Bloat control", "GP", "Depth limit (always), additionally a size limit, or lexicographic "
+                 "parsimony: equal fitness → smaller tree wins tournaments.", operator_control("bloat"), name_mono=False),
+        list_row("Max. tree size", "GP", "Maximum number of nodes (with the size limit).", s_size.control,
+                 name_mono=False),
+        list_row("Adaptive control", "GP", "Changes parameters during the run, e.g. with the generation or the "
+                 "diversity: presets, or your own Python function (Add / edit custom operators → Adaptive control). "
+                 "Its effect: the plot view \"Parameters over generations\".", operator_control("control"),
+                 name_mono=False),
+        list_row("Numba acceleration", "App", "Evaluates regression trees and runs lexicase selection as "
+                 "compiled code (numba): same results, shorter runs." + ("" if fast.AVAILABLE else
+                 " Not available: numba is not installed."), numba_switch, name_mono=False),
+        list_row("Deep-tree acceleration", "App", "Symbolic regression: children are evaluated only from the changed "
+                 "subtree upwards (Langdon & Banzhaf 2022); off: as in DEAP. Same results, shorter runs.",
+                 deep_switch, name_mono=False),
+        list_row("Expert mode", "App", "Number fields instead of sliders, everywhere in the app: values outside "
+                 "the slider ranges become possible, only real limits remain (e.g. probabilities 0 – 1). "
+                 "Switching back moves such values to the nearest end of the slider.", expert_switch, name_mono=False),
+    ], spacing=0), padding=0)
+    advanced_card.visible = config.show_advanced
+
+    advanced_switch = ft.Switch(value=config.show_advanced)
+
+    async def toggle_advanced(e):
         config.show_advanced = advanced_card.visible = bool(e.control.value)
         advanced_card.update()
+        if config.show_advanced:   # bring the new rows into view: the switch moves to the top
+            await asyncio.sleep(0.05)   # the card has to be laid out first
+            await parameters_column.scroll_to(scroll_key="advanced_switch", duration=600)
 
     def open_reset_dialog(e):
         """All parameters back to their defaults, after typing "yes"."""
@@ -2390,6 +2531,10 @@ async def main(page: ft.Page):
             for flag, switch in group.items():
                 switch.value = getattr(config, flag)
         seed_field.value, seed_field.error = str(config.seed), None
+        subtree_dd.value, ephemeral_dd.value = config.subtree_method, config.ephemeral_mode
+        dt_order_dd.value, downsampling_dd.value = config.double_tournament_order, config.downsampling
+        numba_switch.value = config.numba_acceleration and fast.AVAILABLE
+        deep_switch.value = config.deep_acceleration
         exp_seed_field.value, exp_seed_field.error = str(config.exp_seed), None
         plot_adjust_switch.value = config.plot_adjust
         advanced_switch.value = advanced_card.visible = config.show_advanced
@@ -2404,39 +2549,42 @@ async def main(page: ft.Page):
     settings_reset_btn = link_button(ft.Icons.RESTART_ALT, "Reset all settings to defaults", open_reset_dialog)
 
     advanced_switch.on_change = toggle_advanced
+    parameters_column = ft.Column(
+        [
+            ft.Row([page_intro("Additional parameters"), ft.Container(expand=True), operator_btn],
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            card(ft.Column([
+                list_header("Parameter", "Scope", "Description", "Value"),
+                list_row("Selection method", "GP", "Method for selecting individuals for the next generation.", operator_control("selection"), name_mono=False),
+                list_row("Tournament size", "GP", "Size of each tournament (tournament, double tournament and ROIDS).", s_tourn.control, name_mono=False),
+                list_row("Down-sampling", "GP", "Selection on a random or informed subset of the training cases, "
+                         "new in each generation (for the methods without their own down-sampling).", downsampling_dd,
+                         name_mono=False),
+                list_row("Down-sample rate d", "GP", "Share of training cases in each down-sample (down-sampling setting, "
+                         "DS / IDS lexicase methods and ROIDS).", s_ds.control, name_mono=False),
+                list_row("Outlier rate γ", "GP", "Share of training cases with the highest mean error that are "
+                         "excluded before down-sampling (ROIDS only).", s_gamma.control, name_mono=False),
+                list_row("Initialization method", "GP", "How the individuals of the first generation are created.", operator_control("initialization"), name_mono=False),
+                list_row("Min. initial tree depth", "GP", "Minimum tree depth of the individuals in the first generation.", s_min_depth.control, name_mono=False),
+                list_row("Max. initial tree depth", "GP", "Maximum tree depth of the individuals in the first generation.", s_max_depth.control, name_mono=False),
+                list_row("Max. tree depth", "GP", "Maximum tree depth allowed after crossover and mutation.", s_max_tree.control, name_mono=False),
+                list_row("Elitism", "GP", "Best individuals copied unchanged into the next generation.", s_elite.control,
+                         name_mono=False),
+                list_row("Random seed", "GP", "Same seed and settings give the same run; 0 = a new random run each time.",
+                         seed_field, name_mono=False),
+                list_row("Plot adjustment", "App", "Use fixed, problem-specific axis limits instead of autoscaling.", plot_adjust_switch, name_mono=False),
+                list_row("Inter-generation pause", "App", "Minimum pause between two displayed generations. Can be changed during a run.", s_pause.control, name_mono=False),
+            ], spacing=0), padding=0),
+            ft.Row([advanced_switch, ft.Text("Show advanced settings / parameters", size=13, color=S.INK),
+                    ft.Container(expand=True), settings_reset_btn],
+                   spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                   key=ft.ScrollKey("advanced_switch")),
+            advanced_card,
+        ],
+        spacing=20, scroll=ft.ScrollMode.AUTO,
+    )
     parameters_view = ft.Container(
-        ft.Column(
-            [
-                ft.Row([page_intro("Additional parameters"), ft.Container(expand=True), operator_btn],
-                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                card(ft.Column([
-                    list_header("Parameter", "Scope", "Description", "Value"),
-                    list_row("Selection method", "GP", "Method for selecting individuals for the next generation.", operator_control("selection"), name_mono=False),
-                    list_row("Tournament size", "GP", "Size of each tournament (tournament selection and ROIDS).", s_tourn.control, name_mono=False),
-                    list_row("Down-sample rate d", "GP", "Share of training cases used for selection in each generation "
-                             "(down-sampled / informed down-sampled (ε-)lexicase and ROIDS).", s_ds.control, name_mono=False),
-                    list_row("Parent sampling rate s", "GP", "Share of the population used to measure distances "
-                             "between training cases (informed down-sampling and ROIDS).", s_rho.control, name_mono=False),
-                    list_row("Distance interval k", "GP", "Generations between two updates of the case distances "
-                             "(informed down-sampling and ROIDS).", s_k.control, name_mono=False),
-                    list_row("Outlier rate γ", "GP", "Share of training cases with the highest mean error that are "
-                             "excluded before down-sampling (ROIDS only).", s_gamma.control, name_mono=False),
-                    list_row("Initialization method", "GP", "How the individuals of the first generation are created.", operator_control("initialization"), name_mono=False),
-                    list_row("Min. initial tree depth", "GP", "Minimum tree depth of the individuals in the first generation.", s_min_depth.control, name_mono=False),
-                    list_row("Max. initial tree depth", "GP", "Maximum tree depth of the individuals in the first generation.", s_max_depth.control, name_mono=False),
-                    list_row("Max. tree depth", "GP", "Maximum tree depth allowed after crossover and mutation.", s_max_tree.control, name_mono=False),
-                    list_row("Plot adjustment", "App", "Use fixed, problem-specific axis limits instead of autoscaling.", plot_adjust_switch, name_mono=False),
-                    list_row("Inter-generation pause", "App", "Minimum pause between two displayed generations. Can be changed during a run.", s_pause.control, name_mono=False),
-                ], spacing=0), padding=0),
-                ft.Row([advanced_switch, ft.Text("Show advanced settings / parameters", size=13, color=S.INK),
-                        ft.Container(width=28), expert_switch,
-                        ft.Text("Expert mode: number fields instead of sliders", size=13, color=S.INK),
-                        ft.Container(expand=True), settings_reset_btn],
-                       spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                advanced_card,
-            ],
-            spacing=20, scroll=ft.ScrollMode.AUTO,
-        ),
+        parameters_column,
         padding=ft.Padding.only(left=32, right=32, top=24, bottom=24), expand=True,
     )
 
@@ -2492,11 +2640,18 @@ async def main(page: ft.Page):
     DESCRIBED = [("selection_method", "selection", None), ("population_size", "population", None),
                  ("generations", "generations", None), ("crossover_probability", "crossover", None),
                  ("mutation_probability", "mutation", None), ("tourn_size", "tournament", None),
-                 ("ds_rate", "down-sampling", None), ("initialization", "init", None),
+                 ("parsimony_size", "parsimony size", None), ("double_tournament_order", "order", None),
+                 ("lexicase_epsilon", "fixed ε", None),
+                 ("downsampling", "down-sampling", None), ("ds_rate", "down-sample rate", None), ("initialization", "init", None),
                  ("max_tree_depth", "max depth", None), ("crossover_type", "crossover type", None),
-                 ("mutation_type", "mutation type", None), ("bloat_control", "bloat", None),
+                 ("inner_node_probability", "inner nodes", None),
+                 ("mutation_type", "mutation type", None), ("subtree_min_depth", "subtree min. depth", None),
+                 ("subtree_max_depth", "subtree max. depth", None), ("subtree_method", "subtree method", None),
+                 ("ephemeral_mode", "ephemeral", None), ("bloat_control", "bloat", None),
                  ("max_tree_size", "max size", None), ("elitism", "elitism", None),
-                 ("fitness_function", "fitness", None), ("training_y", "training cases", len),
+                 ("fitness_function", "fitness", None), ("numba_acceleration", "numba", None),
+                 ("deep_acceleration", "deep trees", None), ("parameter_control", "control", None),
+                 ("training_y", "training cases", len),
                  ("validation_y", "validation cases", len)]
     BLOCK_FLAGS = [k for k in config.RUN_SETTING_KEYS if k.endswith("_func") or k.endswith("_erc")
                    or k.startswith("ps_") or k.startswith("logic_")]
@@ -2505,7 +2660,7 @@ async def main(page: ft.Page):
         parts = []
         for key, name, conv in DESCRIBED:
             if key in keys:
-                value = conv(settings[key]) if conv else settings[key]
+                value = conv(settings[key]) if conv else settings.get(key)
                 parts.append(f"{name} {value}")
         if "blocks" in keys:
             parts.append("blocks " + ", ".join(k.split("_")[1] if "_" in k else k
@@ -2519,7 +2674,7 @@ async def main(page: ft.Page):
                     "mutation_probability"}
         keys = set()
         for key, _, conv in DESCRIBED:
-            values = [repr(conv(s[key]) if conv else s[key]) for s in settings]
+            values = [repr(conv(s[key]) if conv else s.get(key)) for s in settings]
             if len(set(values)) > 1:
                 keys.add(key)
         if len({tuple(bool(s.get(k)) for k in BLOCK_FLAGS) for s in settings}) > 1:
@@ -2610,6 +2765,7 @@ async def main(page: ft.Page):
                                      padding=ft.Padding.symmetric(horizontal=20, vertical=14)))
         exp_rows.controls = rows
         exp_add_btn.disabled = exp["running"] or len(exp["configs"]) >= len(S.CATEGORICAL)
+        exp_script_btn.disabled = not exp["configs"]
         rebuild_problem_chips()
 
     # ---- problems of the experiment (batch) ----
@@ -2718,6 +2874,10 @@ async def main(page: ft.Page):
             exp["view"] = problem.expression
         label = dict(gp.SELECTION_METHODS).get(settings["selection_method"], settings["selection_method"])
         label = label.split(" (")[0]
+        method = settings["selection_method"]
+        if (settings.get("downsampling", "None") != "None" and method not in gp.DOWNSAMPLED_METHODS
+                and method != "Random"):
+            label += " + " + ("DS" if settings["downsampling"] == "Random" else "IDS")
         taken = {c["label"] for c in exp["configs"]}
         if label in taken:
             k = 2
@@ -2734,6 +2894,49 @@ async def main(page: ft.Page):
         await refresh_experiment()
 
     exp_add_btn = link_button(ft.Icons.ADD, "Add current settings", add_configuration)
+
+    async def reset_experiment(e):
+        """Empty the Experiments tab (configurations, problems, results); undo is offered."""
+        if exp["running"]:
+            return
+        saved = {key: exp.get(key) for key in ("configs", "problems", "results", "analyses", "view", "total", "done",
+                                               "elapsed")}
+        saved_view = exp_view["mode"]
+        exp.update(configs=[], problems=[], results={}, analyses={}, view=None, total=0, done=0, pinned=False)
+        exp_view["mode"] = "main"
+        sync_exp_controls()
+        sync_exp_status()
+        await refresh_experiment()
+
+        async def undo():
+            if exp["running"]:
+                return
+            exp.update(saved)
+            exp_view["mode"] = saved_view
+            sync_exp_controls()
+            sync_exp_status()
+            await refresh_experiment()
+
+        toast("Experiment reset", action="Undo", on_action=undo, seconds=6)
+
+    exp_reset_btn = link_button(ft.Icons.RESTART_ALT, "Reset experiment", reset_experiment)
+
+    async def export_script(e):
+        """The experiment as a Python script using gpexplore's API (to run it without the app)."""
+        if not exp["configs"]:
+            return
+        keys = [k for k in exp["problems"] if k in problems.REGISTRY] or [exp["configs"][0]["problem"]]
+        stem = "gpexplore_experiment_" + (file_stem(problem_title(keys[0])) if len(keys) == 1 else "batch")
+        try:
+            text = await asyncio.to_thread(experiments.python_script, list(exp["configs"]), keys,
+                                           int(s_runs.value), int(config.exp_seed), stem)
+        except Exception as exc:
+            toast(f"Could not write the script: {exc}", seconds=6)
+            return
+        await save_bytes(text.encode("utf-8"), "Export experiment as Python script", stem + ".py", "py")
+
+    exp_script_btn = link_button(ft.Icons.CODE, "Python script", export_script)
+    exp_script_btn.disabled = True
 
     def problem_data(problem, sizes):
         """Data of a problem for the batch, reproducible from the first seed."""
@@ -2754,21 +2957,22 @@ async def main(page: ft.Page):
 
     def settings_for(c, key, cache):
         """Settings of configuration c on problem `key`. On the problem it was added on, the
-        configuration runs exactly as added. On other problems its GP parameters stay, while
-        data and building blocks are set as selecting the problem in the Run tab would set them;
-        all configurations get the same data there."""
+        configuration keeps its building blocks; on other problems its GP parameters stay, while
+        the building blocks are set as selecting the problem in the Run tab would set them.
+        The data always come from the first seed and the data sizes (not from the Run tab, whose
+        data are drawn anew e.g. when the training size changes): configurations with the same
+        data sizes run on the same data, and the batch can be repeated."""
         settings = dict(c["settings"])
-        if key == c["problem"]:
-            return settings
         problem = problems.get(key)
-        origin = problems.REGISTRY.get(c["problem"])
-        settings["target_function"] = key
-        if problem.kind == "ps" or (origin is not None and origin.kind == "ps"):
-            for flag in synthesis.GROUP_FLAGS:
-                settings[flag] = problem.kind == "ps"
-        if problem.kind == "logic":
-            for flag in synthesis.GATE_FLAGS:
-                settings[flag] = flag in problem.gates
+        if key != c["problem"]:
+            origin = problems.REGISTRY.get(c["problem"])
+            settings["target_function"] = key
+            if problem.kind == "ps" or (origin is not None and origin.kind == "ps"):
+                for flag in synthesis.GROUP_FLAGS:
+                    settings[flag] = problem.kind == "ps"
+            if problem.kind == "logic":
+                for flag in synthesis.GATE_FLAGS:
+                    settings[flag] = flag in problem.gates
         train, val, noise, outliers = c["sizes"]
         if problem.kind == "ps" or (problem.kind == "sr" and getattr(problem, "dataset", False)):
             train, val = problem.train_size, problem.test_size
@@ -2811,6 +3015,7 @@ async def main(page: ft.Page):
                                      else ft.MouseCursor.BASIC)
         s_runs.disabled = s_workers.disabled = running
         exp_seed_field.disabled = running
+        exp_reset_btn.disabled = running or not (exp["configs"] or exp["problems"] or exp["results"])
         exp_seed_field.text_style = ft.TextStyle(font_family=S.MONO, size=13, color=S.FAINT if running else S.INK)
         exp_seed_field.border_color = S.RULE_SOFT if running else S.RULE
         rebuild_exp_rows()
@@ -3145,26 +3350,34 @@ async def main(page: ft.Page):
         keys = [k for k in exp["problems"] if any(exp_groups(k))]
         return file_stem(problem_title(keys[0])) if len(keys) == 1 else "batch"
 
-    async def save_bytes(data, title, file_name, ext):
+    async def run_export(what, make, title, file_name, ext):
+        """Prepare an export off the UI thread; meanwhile a spinner says what is being prepared and
+        the export buttons are disabled. Then the save dialog opens."""
+        if exp_busy.visible or not finished_sets():
+            return
+        exp_busy_text.value = f"Preparing {what} …"
+        exp_busy.visible = True
+        for button in exp_export_buttons:
+            button.disabled = True
+        page.update()
         try:
-            path = await file_picker.save_file(dialog_title=title, file_name=file_name,
-                                               file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=[ext],
-                                               src_bytes=data)
-            if path:
-                toast(f"Saved  {os.path.basename(path)}", seconds=4)
+            data = await asyncio.to_thread(make)
         except Exception as exc:
-            toast(f"Could not save the file: {exc}", seconds=5)
+            toast(f"Could not create the {what}: {exc}", seconds=6)
+            return
+        finally:
+            exp_busy.visible = False
+            for button in exp_export_buttons:
+                button.disabled = False
+            page.update()
+        await save_bytes(data, title, file_name, ext)
 
     async def export_experiment(variant):
         sets, labels = finished_sets(), exp_labels()
-        if not sets:
-            return
-        if variant == "raw":
-            data = await asyncio.to_thread(experiments.to_csv_raw, sets, labels)
-        else:
-            data = await asyncio.to_thread(experiments.to_csv_aggregated, sets, labels)
-        await save_bytes(data, f"Save {variant} results as CSV", f"gpexplore_experiment_{export_stem()}_{variant}.csv",
-                         "csv")
+        make = (lambda: experiments.to_csv_raw(sets, labels)) if variant == "raw" else \
+            (lambda: experiments.to_csv_aggregated(sets, labels))
+        await run_export(f"{variant} CSV", make, f"Save {variant} results as CSV",
+                         f"gpexplore_experiment_{export_stem()}_{variant}.csv", "csv")
 
     async def export_aggregated(e):
         await export_experiment("aggregated")
@@ -3230,19 +3443,24 @@ async def main(page: ft.Page):
         return plots.render_experiment_report(report_overview(), sections)
 
     async def export_pdf(e):
-        if not finished_sets():
-            return
-        try:
-            data = await asyncio.to_thread(build_report)
-        except Exception as exc:
-            toast(f"Could not create the PDF: {exc}", seconds=6)
-            return
-        await save_bytes(data, "Save all plots as PDF", f"gpexplore_experiment_{export_stem()}.pdf", "pdf")
+        await run_export("PDF report", build_report, "Save all plots as PDF",
+                         f"gpexplore_experiment_{export_stem()}.pdf", "pdf")
 
-    exp_export_row = ft.Row([link_button(ft.Icons.PICTURE_AS_PDF_OUTLINED, "Plots as PDF", export_pdf),
-                             link_button(ft.Icons.TABLE_CHART_OUTLINED, "Aggregated CSV", export_aggregated),
-                             link_button(ft.Icons.DATASET_OUTLINED, "Raw CSV", export_raw)],
-                            spacing=8, visible=False)
+    async def export_zip(e):
+        sets, labels, generations = finished_sets(), exp_labels(), exp_generations()
+        await run_export("ZIP with all plots", lambda: plots.experiment_plots_zip(sets, labels, generations),
+                         "Save all plots as ZIP (PNG and PDF)", f"gpexplore_experiment_{export_stem()}_plots.zip",
+                         "zip")
+
+    exp_busy_text = ft.Text("", size=12.5, color=S.INK)
+    exp_busy = ft.Row([ft.ProgressRing(width=14, height=14, stroke_width=2, color=S.ACCENT), exp_busy_text],
+                      spacing=8, visible=False, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+    exp_export_buttons = [link_button(ft.Icons.PICTURE_AS_PDF_OUTLINED, "Plots as PDF", export_pdf),
+                          link_button(ft.Icons.FOLDER_ZIP_OUTLINED, "Plots as ZIP", export_zip),
+                          link_button(ft.Icons.TABLE_CHART_OUTLINED, "Aggregated CSV", export_aggregated),
+                          link_button(ft.Icons.DATASET_OUTLINED, "Raw CSV", export_raw)]
+    exp_export_row = ft.Row([exp_busy, ft.Container(width=8), *exp_export_buttons], spacing=8, visible=False,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
     def exp_plot_card(title, image, which):
         return card(ft.Column([ft.Row([title], height=22),
@@ -3327,7 +3545,9 @@ async def main(page: ft.Page):
             ft.Row([page_intro("Experiments"), ft.Container(expand=True), cores_text],
                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
             card(ft.Column([
-                ft.Container(ft.Row([caps("Configurations"), ft.Container(expand=True), exp_add_btn],
+                ft.Container(ft.Row([caps("Configurations"), ft.Container(expand=True), exp_script_btn,
+                                     ft.Container(width=8), exp_reset_btn,
+                                     ft.Container(width=8), exp_add_btn],
                                     spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                              padding=ft.Padding.only(left=20, right=14, top=8, bottom=8),
                              border=ft.Border(bottom=ft.BorderSide(1, S.RULE))),
@@ -3427,10 +3647,23 @@ async def main(page: ft.Page):
     # the middle of the screen. Flet's window manager picks the display under
     # the mouse cursor, so on multi-monitor setups the app opens where you are.
     if not page.web:   # in the browser there is no window to place
+        def window_changed(e):
+            """Remember the window size for the next start; not the size while maximized or in full
+            screen, so the app always starts as a normal window."""
+            w = page.window
+            if (e.type == ft.WindowEventType.RESIZED and not w.maximized and not w.full_screen
+                    and w.width and w.height):
+                size = int(round(w.width)), int(round(w.height))
+                if size != (config.window_width, config.window_height):
+                    config.window_width, config.window_height = size
+                    config.save_settings()   # right away: the app may be quit before the next autosave
+
         await page.window.center()
         page.window.visible = True
         page.update()
         await page.window.to_front()
+        page.window.on_event = window_changed
+        page.update()
 
 
 if __name__ == "__main__":
@@ -3440,6 +3673,6 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8550, help="port of the web interface (with --web)")
     args = parser.parse_args()
     if args.web:
-        ft.run(main, view=ft.AppView.WEB_BROWSER, port=args.port)
+        webserver.run(main, args.port)   # the Flet app plus a download route for exports
     else:
         ft.run(main, view=ft.AppView.FLET_APP_HIDDEN)

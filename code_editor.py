@@ -6,6 +6,8 @@ text is transparent (cursor and selection stay visible). Every change re-colours
 layer below. Colours only (no bold or italic), so every character keeps its width.
 """
 
+import asyncio
+import inspect
 import keyword
 import re
 
@@ -94,6 +96,10 @@ def auto_indent(old, new):
     p = 0
     while p < len(old) and old[p] == new[p]:
         p += 1
+    # In a run of equal characters the inserted one cannot be told apart: Enter at the end of a
+    # line adds "\n" next to the existing one. Take the earliest position (the cursor's line).
+    while p > 0 and new[p - 1] == new[p]:
+        p -= 1
     typed = new[p]
     if typed == "\n":
         previous = new[:p].rsplit("\n", 1)[-1]
@@ -158,19 +164,25 @@ class CodeEditor:
             border=ft.Border.all(1, S.RULE), border_radius=4, bgcolor=S.PANEL)
         self.control = ft.Column(([ft.Text(label, size=12.5, color=S.INK)] if label else []) + [editor], spacing=4)
 
-    def _changed(self, e):
+    async def _changed(self, e):
         new = self.field.value or ""
         edit = auto_indent(self._last, new)
+        self._last = edit[0] if edit is not None else new
+        self.layer.spans = spans(self._last)
+        self.layer.update()
         if edit is not None:
             new, cursor = edit
             self.field.value = new
+            self.field.update()
+            # The desktop client puts the cursor at the end when the text changes and ignores a
+            # cursor position sent together with the text, so the cursor follows one frame later.
+            await asyncio.sleep(0.02)
             self.field.selection = ft.TextSelection(base_offset=cursor, extent_offset=cursor)
             self.field.update()
-        self._last = new
-        self.layer.spans = spans(new)
-        self.layer.update()
         if self.on_change:
-            return self.on_change(e)
+            result = self.on_change(e)
+            if inspect.isawaitable(result):
+                await result
 
     @property
     def value(self):

@@ -10,6 +10,7 @@ import ast
 import math
 import random
 import string
+import zlib
 from dataclasses import dataclass, field
 
 
@@ -17,23 +18,35 @@ from dataclasses import dataclass, field
 # Type tags
 # --------------------------------------------------------------------------
 
-class Num:   # float (symbolic regression)
+class _TypeTag(type):
+    """Hash by name, not by memory address: DEAP's crossover picks the type of the crossover
+    point from a set of these classes, and with address hashes the order of that set (and
+    so the run) changed from process to process despite the same seed."""
+
+    def __hash__(cls):
+        return zlib.crc32(cls.__name__.encode())
+
+    def __eq__(cls, other):
+        return cls is other
+
+
+class Num(metaclass=_TypeTag):   # float (symbolic regression)
     pass
 
 
-class Int:
+class Int(metaclass=_TypeTag):
     pass
 
 
-class Bool:
+class Bool(metaclass=_TypeTag):
     pass
 
 
-class Str:
+class Str(metaclass=_TypeTag):
     pass
 
 
-class Vec:   # list of int
+class Vec(metaclass=_TypeTag):   # list of int
     pass
 
 
@@ -157,36 +170,41 @@ class Env:
 
 def compile_tree(individual, arg_names):
     """Turn a DEAP tree into a callable f(*inputs) with lazy if / loop semantics."""
-    nodes = list(individual)
     argindex = {n: i for i, n in enumerate(arg_names)}
-    pos = 0
-
-    def build():
-        nonlocal pos
-        node = nodes[pos]
-        pos += 1
+    # built bottom-up without recursion (prefix order backwards: the children of a node are
+    # on the stack when the node comes, its first child topmost), so any depth works
+    stack = []
+    for node in reversed(list(individual)):
         if node.arity == 0:
-            # symbolic terminals (conv_fct is str): renamed arguments and the loop variable
-            if getattr(node, "conv_fct", None) is str:
-                if node.value in argindex:
-                    k = argindex[node.value]
-                    return lambda env: env.inputs[k]
-                if node.value == ELEM:
-                    return lambda env: env.elem
-            value = node.value
-            return lambda env: value
+            stack.append(_leaf(node, argindex))
+            continue
+        kids = [stack.pop() for _ in range(node.arity)]
         block = BLOCKS.get(node.name)
-        kids = [build() for _ in range(node.arity)]
         if block is None:  # numeric primitive from symbolic regression (add, sin, ...)
-            fn = node_function(node.name)
-            return lambda env: fn(*[k(env) for k in kids])
-        return _make(block, kids)
-
-    root = build()
+            stack.append(_numeric(node_function(node.name), kids))
+        else:
+            stack.append(_make(block, kids))
+    root = stack[0]
 
     def run(*inputs):
         return root(Env(inputs))
     return run
+
+
+def _leaf(node, argindex):
+    # symbolic terminals (conv_fct is str): renamed arguments and the loop variable
+    if getattr(node, "conv_fct", None) is str:
+        if node.value in argindex:
+            k = argindex[node.value]
+            return lambda env: env.inputs[k]
+        if node.value == ELEM:
+            return lambda env: env.elem
+    value = node.value
+    return lambda env: value
+
+
+def _numeric(fn, kids):
+    return lambda env: fn(*[k(env) for k in kids])
 
 
 _NUMERIC = {}

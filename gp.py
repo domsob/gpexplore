@@ -11,9 +11,11 @@ import math
 import operator
 import random
 import re
+import sys
 from collections import Counter
 import threading
 import time
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from functools import partial
 from math import sqrt
@@ -22,6 +24,8 @@ import numpy as np
 from deap import algorithms, base, creator, gp, tools
 
 import config
+import deep
+import fast
 import operators
 import problems
 import synthesis
@@ -60,6 +64,47 @@ if not hasattr(creator, "FitnessMin"):
     creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
 if not hasattr(creator, "Individual"):
     creator.create("Individual", gp.PrimitiveTree, fitness=creator.FitnessMin)
+
+
+# Trees up to this height are compiled by DEAP (a Python expression run through eval); Python's
+# parser cannot nest much deeper. Deeper trees are evaluated by a loop over their nodes.
+EVAL_DEPTH = 80
+MAX_DEPTH = 1000   # largest max. tree depth GPExplore accepts
+# The interpreters of program synthesis and logic call one function per tree level, and deep
+# trees exceed Python's default limit of 1000 nested calls.
+sys.setrecursionlimit(max(sys.getrecursionlimit(), 10 * MAX_DEPTH))
+
+
+def compile_individual(expr, pset):
+    """A function f(*inputs) of a symbolic regression tree: compiled by DEAP as before for the
+    usual depths, a loop over the nodes for deeper trees (the same functions, the same values)."""
+    if expr.height <= EVAL_DEPTH:
+        return gp.compile(expr, pset)
+    index = {name: i for i, name in enumerate(pset.arguments)}
+    steps = []   # prefix order backwards: the arguments of a function come before it
+    for node in reversed(expr):
+        if node.arity:
+            steps.append((pset.context[node.name], node.arity))
+        elif isinstance(node.value, str) and node.value in index:
+            steps.append((None, index[node.value]))      # an input
+        elif isinstance(node.value, str):
+            steps.append((False, pset.context[node.value]))   # a named constant
+        else:
+            steps.append((False, node.value))
+
+    def run(*inputs):
+        stack = []
+        for fn, x in steps:
+            if fn is None:
+                stack.append(inputs[x])
+            elif fn is False:
+                stack.append(x)
+            else:   # x arguments on top of the stack, the first one topmost
+                args = stack[-x:][::-1]
+                del stack[-x:]
+                stack.append(fn(*args))
+        return stack[0]
+    return run
 
 
 def _eager(block):
@@ -204,7 +249,7 @@ def gen_half_and_half(pset, min_, max_, type_=None):
 # --------------------------------------------------------------------------
 
 # (key, label) of all selection methods, in UI order.
-CROSSOVERS = ["One-point", "Leaf-biased (90/10)"]
+CROSSOVERS = ["One-point", "Leaf-biased"]
 MUTATIONS = ["Uniform (subtree)", "Node replacement", "Shrink", "Ephemeral constants", "Mixed"]
 BLOAT_CONTROLS = ["Depth limit", "Depth + size limit", "Lexicographic parsimony"]
 FITNESS_FUNCTIONS = ["MSE", "MAE", "RMSE", "MSE + linear scaling"]
@@ -215,8 +260,12 @@ FITNESS_TITLES = {"MSE": "Mean squared error", "MAE": "Mean absolute error", "RM
 # and informed down-sampling, then ROIDS), finally the baselines.
 SELECTION_METHODS = [
     ("Tournament", "Tournament"),
+    ("Double tournament", "Double tournament (Luke & Panait)"),
+    ("Roulette", "Roulette wheel (fitness-proportionate)"),
+    ("Stochastic universal sampling", "Stochastic universal sampling (Baker)"),
     ("Lexicase", "Lexicase (Spector)"),
     ("Epsilon-Lexicase", "ε-Lexicase (La Cava et al.)"),
+    ("Fixed Epsilon-Lexicase", "ε-Lexicase with fixed ε"),
     ("DS Lexicase", "Down-sampled lexicase (Hernandez et al.)"),
     ("DS Epsilon-Lexicase", "Down-sampled ε-Lexicase (Geiger et al.)"),
     ("IDS Lexicase", "Informed down-sampled lexicase (Boldi et al.)"),
@@ -226,13 +275,13 @@ SELECTION_METHODS = [
     ("Best", "Best"),
     ("Worst", "Worst"),
 ]
-EPSILON_METHODS = {"Epsilon-Lexicase", "DS Epsilon-Lexicase", "IDS Epsilon-Lexicase"}
+EPSILON_METHODS = {"Epsilon-Lexicase", "DS Epsilon-Lexicase", "IDS Epsilon-Lexicase", "Fixed Epsilon-Lexicase"}
 LEXICASE_METHODS = EPSILON_METHODS | {"Lexicase", "DS Lexicase", "IDS Lexicase"}
 DOWNSAMPLED_METHODS = {"DS Epsilon-Lexicase", "IDS Epsilon-Lexicase", "DS Lexicase", "IDS Lexicase", "ROIDS"}
 INFORMED_METHODS = {"IDS Epsilon-Lexicase", "IDS Lexicase", "ROIDS"}
 
 
-def epsilon_lexicase(errors, k, cases, rng, epsilon=True):
+def epsilon_lexicase(errors, k, cases, rng, epsilon=True, fixed=None, use_numba=False):
     """ε-lexicase selection (La Cava et al. 2016) on the given training cases.
 
     errors: (individuals x cases) matrix of squared errors.
@@ -240,18 +289,27 @@ def epsilon_lexicase(errors, k, cases, rng, epsilon=True):
     candidates with e_t <= e*_t + ε_t survive, where e*_t is the best error
     among the remaining candidates and ε_t = median(|e_t - median(e_t)|),
     the median absolute deviation over the remaining candidates
-    (as in Geiger et al. 2024, Eq. 3).
+    (as in Geiger et al. 2024, Eq. 3). With `fixed`, ε is that constant on every case
+    (DEAP's selEpsilonLexicase).
     """
     errors = errors[:, cases]
     n, m = errors.shape
     chosen = np.empty(k, dtype=int)
     everyone = np.arange(n)
+    if use_numba and fast.AVAILABLE:   # the same selection, the case loop compiled
+        errors = np.ascontiguousarray(errors, dtype=np.float64)
+        mode = 0 if not epsilon else 2 if fixed is not None else 1
+        for i in range(k):
+            candidates = fast.lexicase_survivors(errors, everyone, rng.permutation(m), mode,
+                                                 float(fixed) if fixed is not None else 0.0)
+            chosen[i] = candidates[rng.integers(len(candidates))]
+        return chosen
     for i in range(k):
         candidates = everyone
         for case in rng.permutation(m):
             column = errors[candidates, case]
             if epsilon:
-                eps = np.median(np.abs(column - np.median(column)))
+                eps = fixed if fixed is not None else np.median(np.abs(column - np.median(column)))
                 candidates = candidates[column <= column.min() + eps]
             else:  # standard lexicase (Spector 2012): only the elite on this case survive
                 candidates = candidates[column == column.min()]
@@ -300,11 +358,56 @@ def solve_distances(errors):
     return solved @ (1 - solved).T + (1 - solved) @ solved.T
 
 
+def adjusted_fitness(population):
+    """Koza's adjusted fitness 1 / (1 + error): positive, larger is better (0 for inf or nan).
+    Fitness-proportionate selection needs it, since GPExplore minimizes the error."""
+    error = np.array([ind.fitness.values[0] for ind in population], dtype=float)
+    with np.errstate(over="ignore", invalid="ignore"):
+        adjusted = 1.0 / (1.0 + np.maximum(error, 0.0))
+    return np.where(np.isfinite(adjusted), adjusted, 0.0)
+
+
+def roulette(weights, k, rng):
+    """Roulette wheel (DEAP selRoulette): k independent spins, each individual's chance
+    proportional to its weight."""
+    total = weights.sum()
+    if total <= 0:
+        return rng.integers(len(weights), size=k)
+    return rng.choice(len(weights), size=k, p=weights / total)
+
+
+def stochastic_universal_sampling(weights, k, rng):
+    """Stochastic universal sampling (Baker 1987; DEAP selStochasticUniversalSampling): one spin
+    with k equally spaced pointers, so the number of copies is close to its expectation."""
+    total = weights.sum()
+    if total <= 0:
+        return rng.integers(len(weights), size=k)
+    order = np.argsort(-weights, kind="stable")        # as in DEAP: best first
+    edges = np.cumsum(weights[order])
+    distance = total / k
+    points = rng.uniform(0, distance) + distance * np.arange(k)
+    return order[np.minimum(np.searchsorted(edges, points, side="left"), len(order) - 1)]
+
+
 def tournament_on_cases(errors, k, cases, tourn_size, rng):
     """Tournament selection on the MSE over the given cases (used by ROIDS)."""
     fitness = errors[:, cases].mean(axis=1)
     contestants = rng.integers(len(fitness), size=(k, tourn_size))
     return contestants[np.arange(k), np.argmin(fitness[contestants], axis=1)]
+
+
+class CaseView:
+    """An individual as a selection method sees it on a down-sample: its fitness and errors on the
+    down-sampled cases only, its size unchanged."""
+
+    def __init__(self, individual, cases, fitness):
+        self.individual = individual
+        self.errors = np.asarray(individual.errors)[cases]
+        self.fitness = creator.FitnessMin()
+        self.fitness.values = (fitness if math.isfinite(fitness) else math.inf,)
+
+    def __len__(self):
+        return len(self.individual)
 
 
 class Selector:
@@ -313,6 +416,13 @@ class Selector:
     def __init__(self, settings):
         self.method = settings["selection_method"]
         self.tourn_size = settings["tourn_size"]
+        self.parsimony_size = settings.get("parsimony_size", config.DEFAULTS["parsimony_size"])
+        self.fitness_first = settings.get("double_tournament_order", "Fitness first") == "Fitness first"
+        self.lexicase_epsilon = settings.get("lexicase_epsilon", config.DEFAULTS["lexicase_epsilon"])
+        self.downsampling = settings.get("downsampling", "None")   # for methods without their own
+        self.use_numba = bool(settings.get("numba_acceleration", False))
+        # fitness of an individual on some training cases (set by the run to match the fitness function)
+        self.case_fitness = lambda ind, cases: float(np.mean(ind.errors[cases]))
         self.ds_rate = settings["ds_rate"]
         self.parent_rate = settings["parent_sampling_rate"]
         self.interval = settings["distance_interval"]
@@ -321,12 +431,16 @@ class Selector:
         seed = settings.get("seed") or None
         self.rng = np.random.default_rng(seed)
         self.last_selected = []
-        self.distances = None
-        self.kept = None              # ROIDS: case indices that are not excluded as outliers
-        self.outliers = None          # ROIDS: excluded case indices (for the plot)
+        self.distances = None         # case distances of informed down-sampling / ROIDS ...
+        self.distance_kind = None     # ... and which of them they are (they differ in metric and cases)
+        self.distance_age = 0         # selections since the distances were computed
+        self.kept = None              # ROIDS: case indices that are not excluded as outliers ...
+        self.excluded = None          # ... and those excluded (kept between the recomputations)
+        self.outliers = None          # the excluded cases of the current generation (ROIDS only, for the plot)
         self.last_downsample = None
         self.selections = 0
-        self.custom = operators.from_settings(settings, "selection")
+        self.settings = settings
+        self._customs = {}            # name -> (name, function) of custom selections used so far
         self.py_rng = random.Random(random.getrandbits(64))   # for custom selection (seeded through `random`)
 
     def __call__(self, population, k):
@@ -343,8 +457,16 @@ class Selector:
         return [min((population[i] for i in row), key=lambda ind: (ind.fitness.values[0], len(ind)))
                 for row in picks]
 
-    def _custom(self, population, k):
-        name, fn = self.custom
+    def _custom_selection(self, name):
+        """(name, function) if `name` is a custom selection (also one switched to during the run)."""
+        if name in operators.BUILTIN["selection"]:
+            return None
+        if name not in self._customs:
+            self._customs[name] = operators.resolve(self.settings, "selection", name)
+        return self._customs[name]
+
+    def _custom(self, population, k, custom):
+        name, fn = custom
         fitness = [float(ind.fitness.values[0]) for ind in population]
         errors = [[float(e) for e in ind.errors] for ind in population]
         sizes = [len(ind) for ind in population]
@@ -356,48 +478,88 @@ class Selector:
         if len(chosen) != k or any(not 0 <= i < len(population) for i in chosen):
             operators.fail("selection", name, f"must return {k} indices between 0 and {len(population) - 1} "
                                               f"(got {len(chosen)}).")
-        self.last_downsample = None
         return [population[i] for i in chosen]
+
+    def _stale(self, kind):
+        """Whether the case distances must be computed (again): every `interval` selections, and
+        whenever an adaptive control switched to a method that needs other distances."""
+        return self.distances is None or self.distance_kind != kind or self.distance_age >= self.interval
+
+    def _distances_done(self, kind, distances):
+        self.distances, self.distance_kind, self.distance_age = distances, kind, 0
 
     def _select(self, population, k):
-        if self.custom is not None:
-            return self._custom(population, k)
+        # the method may change between generations (adaptive control): no stale down-sample, and
+        # outliers only in generations selected by ROIDS
+        self.last_downsample = self.outliers = None
         if self.method == "ROIDS":
             return self._roids(population, k)
-        if self.method not in LEXICASE_METHODS:
-            simple = {
-                "Tournament": self._tournament,
-                "Random": tools.selRandom,
-                "Best": tools.selBest,
-                "Worst": tools.selWorst,
-            }[self.method]
-            return simple(population, k)
-
+        if self.method in DOWNSAMPLED_METHODS:   # (informed) down-sampled (ε-)lexicase
+            errors = np.array([ind.errors for ind in population])
+            epsilon = self.method in EPSILON_METHODS
+            cases = self._downsample(errors, "Random" if self.method.startswith("DS") else "Informed",
+                                     "euclidean" if epsilon else "solve")
+            self.last_downsample = cases
+            self.selections += 1
+            return [population[i] for i in epsilon_lexicase(errors, k, cases, self.rng, epsilon=epsilon,
+                                                            use_numba=self.use_numba)]
+        custom = self._custom_selection(self.method)
+        if self.downsampling == "None" or self.method == "Random":
+            return self._on_all_cases(population, k, custom)
+        # any other method on a (random or informed) down-sample: it sees each individual only
+        # through the down-sampled cases (fitness and errors on them)
         errors = np.array([ind.errors for ind in population])
+        cases = self._downsample(errors, self.downsampling, "solve" if self.method == "Lexicase" else "euclidean")
+        self.last_downsample = cases
+        views = [CaseView(ind, cases, self.case_fitness(ind, cases)) for ind in population]
+        return [view.individual for view in self._on_all_cases(views, k, custom)]
+
+    def _downsample(self, errors, how, kind):
+        """Cases of this generation's down-sample: random, or informed (Boldi et al. 2024: farthest-first
+        traversal over case distances, measured on a few sampled parents every `interval` generations;
+        euclidean distances of the errors, or of the solve vectors for plain lexicase)."""
         n_cases = errors.shape[1]
         ds_size = max(1, int(round(self.ds_rate * n_cases)))
+        if how == "Random":
+            return np.sort(self.rng.choice(n_cases, size=ds_size, replace=False))
+        if self._stale(kind):
+            n_parents = min(len(errors), max(2, int(round(self.parent_rate * len(errors)))))
+            sample = self.rng.choice(len(errors), size=n_parents, replace=False)
+            # In the paper only these parents are evaluated on *all* cases.
+            # GPExplore evaluates everyone on everything (for the plots), so
+            # their full error vectors are already available.
+            self._distances_done(kind, (case_distances if kind == "euclidean" else solve_distances)(errors[sample]))
+        cases = farthest_first_traversal(self.distances, ds_size, self.rng)
+        self.distance_age += 1
+        return cases
 
-        epsilon = self.method in EPSILON_METHODS
-        if self.method in ("Epsilon-Lexicase", "Lexicase"):
-            cases = np.arange(n_cases)
-            self.last_downsample = None
-        elif self.method in ("DS Epsilon-Lexicase", "DS Lexicase"):
-            cases = np.sort(self.rng.choice(n_cases, size=ds_size, replace=False))
-            self.last_downsample = cases
-        else:  # informed down-sampling
-            if self.selections % self.interval == 0 or self.distances is None:
-                n_parents = min(len(population), max(2, int(round(self.parent_rate * len(population)))))
-                sample = self.rng.choice(len(population), size=n_parents, replace=False)
-                # In the paper only these parents are evaluated on *all* cases.
-                # GPExplore evaluates everyone on everything (for the plots), so
-                # their full error vectors are already available.
-                self.distances = (case_distances if epsilon else solve_distances)(errors[sample])
-            cases = farthest_first_traversal(self.distances, ds_size, self.rng)
-            self.last_downsample = cases
-
-        self.selections += 1
-        chosen = epsilon_lexicase(errors, k, cases, self.rng, epsilon=epsilon)
-        return [population[i] for i in chosen]
+    def _on_all_cases(self, population, k, custom):
+        """The selection methods without a down-sampling of their own."""
+        if custom is not None:
+            return self._custom(population, k, custom)
+        if self.method == "Double tournament":
+            # Luke & Panait (2002): a fitness tournament of tourn_size whose winners meet in size
+            # tournaments of two, or the other way round
+            return tools.selDoubleTournament(population, k, fitness_size=self.tourn_size,
+                                             parsimony_size=self.parsimony_size, fitness_first=self.fitness_first)
+        if self.method in ("Roulette", "Stochastic universal sampling"):
+            spin = roulette if self.method == "Roulette" else stochastic_universal_sampling
+            return [population[i] for i in spin(adjusted_fitness(population), k, self.rng)]
+        if self.method in LEXICASE_METHODS:   # Lexicase, Epsilon-Lexicase, Fixed Epsilon-Lexicase
+            errors = np.array([ind.errors for ind in population])
+            self.selections += 1
+            chosen = epsilon_lexicase(errors, k, np.arange(errors.shape[1]), self.rng,
+                                      epsilon=self.method in EPSILON_METHODS,
+                                      fixed=self.lexicase_epsilon if self.method == "Fixed Epsilon-Lexicase" else None,
+                                      use_numba=self.use_numba)
+            return [population[i] for i in chosen]
+        simple = {
+            "Tournament": self._tournament,
+            "Random": tools.selRandom,
+            "Best": tools.selBest,
+            "Worst": tools.selWorst,
+        }[self.method]
+        return simple(population, k)
 
     def _roids(self, population, k):
         """Robust outlier-aware informed down-sampling (Geiger et al. 2026, Alg. 1)
@@ -410,17 +572,19 @@ class Selector:
         """
         errors = np.array([ind.errors for ind in population])
         n_cases = errors.shape[1]
-        if self.selections % self.interval == 0 or self.distances is None:
+        if self._stale("roids") or self.kept is None:
             n_parents = min(len(population), max(2, int(round(self.parent_rate * len(population)))))
             sample = errors[self.rng.choice(len(population), size=n_parents, replace=False)]
             n_out = min(n_cases - 1, int(round(self.outlier_rate * n_cases)))
             order = np.argsort(sample.mean(axis=0))          # ascending mean error per case
             self.kept = np.sort(order[:n_cases - n_out])
-            self.outliers = np.sort(order[n_cases - n_out:])
-            self.distances = case_distances(sample[:, self.kept])
+            self.excluded = np.sort(order[n_cases - n_out:])
+            self._distances_done("roids", case_distances(sample[:, self.kept]))
+        self.outliers = self.excluded
         ds_size = max(1, int(round(self.ds_rate * n_cases)))
         cases = self.kept[farthest_first_traversal(self.distances, ds_size, self.rng)]
         self.last_downsample = cases
+        self.distance_age += 1
         self.selections += 1
         chosen = tournament_on_cases(errors, k, cases, self.tourn_size, self.rng)
         if self.parsimony:   # ties in down-sample fitness: smaller tree wins
@@ -533,29 +697,27 @@ def tree_nodes_from_string(expression, variables):
     """Prefix node list (as for the tree view) from an individual's string form,
     e.g. for the population browser (only strings are stored per generation)."""
     tokens = [t for t in _TOKEN.findall(expression) if t.strip()]
-    nodes, pos = [], 0
-
-    def parse():
-        nonlocal pos
+    nodes = []
+    open_calls = []   # [index in nodes, name, children so far] of the functions not closed yet
+    pos = 0
+    while pos < len(tokens):
         tok = tokens[pos]
         pos += 1
-        if pos < len(tokens) and tokens[pos] == "(":
+        if tok == ",":
+            continue
+        if tok == ")":
+            index, name, arity = open_calls.pop()
+            block = synthesis.BLOCKS.get(name)
+            nodes[index] = (block.symbol if block else name, arity, "function")
+        elif pos < len(tokens) and tokens[pos] == "(":
             pos += 1
-            index = len(nodes)
+            open_calls.append([len(nodes), tok, 0])
             nodes.append(None)
-            arity = 0
-            while tokens[pos] != ")":
-                parse()
-                arity += 1
-                if tokens[pos] == ",":
-                    pos += 1
-            pos += 1
-            block = synthesis.BLOCKS.get(tok)
-            nodes[index] = (block.symbol if block else tok, arity, "function")
+            continue   # counted as a child once it is closed
         else:
             nodes.append((tok, 0, "variable" if tok in variables else "constant"))
-
-    parse()
+        if open_calls:   # a node is complete: one more child of the enclosing function
+            open_calls[-1][2] += 1
     return nodes
 
 
@@ -609,6 +771,9 @@ class GPRun:
       * paused   -> waits until resumed, stepped or stopped
       * step()   -> computes exactly one more generation, then pauses again
     """
+
+    _text_of = staticmethod(str)   # replaced in _run (kept texts in the deep-tree mode)
+    _deep_eval = None
 
     def __init__(self, settings, start_paused=False, headless=False):
         self.settings = dict(settings)
@@ -772,7 +937,7 @@ class GPRun:
         fit = np.asarray(train_metric, dtype=float)
         sizes = np.array([len(ind) for ind in population])
         depths = np.array([ind.height for ind in population])
-        genotypes = {str(ind) for ind in population}
+        genotypes = {self._text_of(ind) for ind in population}
         phenotypes = {np.round(np.asarray(ind.errors, dtype=float), 9).tobytes() for ind in population}
         blocks = Counter()
         for ind in population:
@@ -793,6 +958,7 @@ class GPRun:
             "blocks": {k: v / total for k, v in blocks.items()},
             "parents": extra.get("parents"), "top_parent": extra.get("top_parent"),
             "variation": extra.get("variation"),
+            "params": extra.get("params"),   # parameter values used for this generation
         }
 
     def _record(self, population, hof, validation_fitness, downsample, outliers=None, extra=None):
@@ -832,7 +998,7 @@ class GPRun:
                           if problem.kind == "ps" else train_metric)
         dynamics = self._dynamics(population, train_metric, extra or {})
         browser = None if self.headless else [
-            (str(ind), t, v, len(ind), ind.height, getattr(ind, "uid", None))
+            (self._text_of(ind), t, v, len(ind), ind.height, getattr(ind, "uid", None))
             for ind, t, v in zip(population, train_metric, val_metric)]
         with self._cond:
             self._history["avg_training"].append(avg_training)
@@ -840,7 +1006,7 @@ class GPRun:
             self._history["best_training"].append(best_training)
             self._history["best_validation"].append(best_validation)
             self._records.append({
-                "expression": str(best), "size": len(best), "depth": best.height,
+                "expression": self._text_of(best), "size": len(best), "depth": best.height,
                 "prediction": prediction, "nodes": _tree_nodes(best, self._variables),
                 "downsample": None if downsample is None else np.array(downsample),
                 "outliers": None if outliers is None else np.array(outliers),
@@ -877,11 +1043,42 @@ class GPRun:
                          min_=s["min_initial_tree_depth"], max_=s["max_initial_tree_depth"])
         toolbox.register("individual", tools.initIterate, creator.Individual, toolbox.expr)
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-        toolbox.register("compile", gp.compile, pset=pset)
+        toolbox.register("compile", compile_individual, pset=pset)
 
         train_X, train_y = s["training_X"], s["training_y"]
         val_X, val_y = s["validation_X"], s["validation_y"]
         val_cache = {}
+
+        # Deep-tree acceleration (deep.py) for symbolic regression; off: evaluation as in DEAP.
+        deep_wanted = bool(s.get("deep_acceleration", True))
+        deep_state = {"on": deep_wanted}
+
+        def text_of(individual):
+            """str(individual), kept on the individual while the deep-tree mode is on (a changed
+            child is evaluated before anything asks for its text, and evaluate() clears it)."""
+            if not deep_state["on"]:
+                return str(individual)
+            text = getattr(individual, "text", None)
+            if text is None:
+                text = individual.text = str(individual)
+            return text
+        self._text_of = text_of
+
+        if problem.kind == "sr" and s.get("numba_acceleration") and fast.AVAILABLE:
+            arg_index = {name: i for i, name in enumerate(pset.arguments)}
+            n_args = len(pset.arguments)
+            arrays = {id(X): np.asarray(X, dtype=np.float64).reshape(len(X), n_args) for X in (train_X, val_X)}
+
+            def outputs_on(individual, X):
+                """Outputs on all rows of X: by the compiled interpreter if the tree has only
+                built-in functions, otherwise as without numba."""
+                program = fast.tree_program(individual, arg_index)
+                if program is None:
+                    return _outputs_of(toolbox.compile(expr=individual), X)
+                return fast.run_program(program[0], program[1], arrays[id(X)])
+        else:
+            def outputs_on(individual, X):
+                return _outputs_of(toolbox.compile(expr=individual), X)
 
         if problem.kind != "sr":
             arg_names = pset.arguments
@@ -908,7 +1105,8 @@ class GPRun:
 
             def evaluate(individual):
                 # identical programs appear often after crossover; run each one only once
-                key = str(individual)
+                individual.text = None
+                key = text_of(individual)
                 errors = train_cache.get(key)
                 if errors is None:
                     errors = case_errors(individual, train_cases)
@@ -922,7 +1120,7 @@ class GPRun:
                 return float(sample_errors(individual).mean())
 
             def sample_errors(individual):
-                key = str(individual)
+                key = text_of(individual)
                 if key not in val_cache:
                     val_cache[key] = case_errors(individual, val_sample)
                 return val_cache[key]
@@ -954,14 +1152,32 @@ class GPRun:
                     operators.fail("fitness", name, f"must return a number (got {value!r}).")
                 return value if math.isfinite(value) else math.inf
 
+            deep_eval = (deep.DeepEvaluator(pset, {"train": train_X, "val": val_X}, s.get("numba_acceleration"))
+                         if deep_wanted else None)
+            self._deep_eval = deep_eval
+
+            def training_outputs(individual):
+                """Outputs on the training data; in the deep-tree mode also those on the validation
+                data (kept on the individual), incrementally from the parent if there is one."""
+                parent = getattr(individual, "parent", None)
+                individual.parent = None
+                individual.deep_out = individual.val_fit = individual.text = None
+                if deep_state["on"]:
+                    result = deep_eval.outputs(individual, parent)
+                    if result is not None:
+                        individual.deep_out = result
+                        return result["train"]
+                return outputs_on(individual, train_X)
+
             def evaluate(individual):
                 if custom_fitness is not None:
-                    outputs = _outputs_of(toolbox.compile(expr=individual), train_X)
+                    outputs = training_outputs(individual)
                     individual.errors = np.minimum(np.abs(outputs - np.asarray(train_y, dtype=float)), 1e30)
                     individual.errors[~np.isfinite(individual.errors)] = 1e30
+                    individual.outputs = outputs   # for the fitness on a down-sample
                     return (custom_value(outputs, train_y),)
                 # Per-case errors are kept on the individual for lexicase.
-                outputs = _outputs_of(toolbox.compile(expr=individual), train_X)
+                outputs = training_outputs(individual)
                 scale = _linear_scaling(outputs, train_y) if scaled else (0.0, 1.0)
                 if scaled:
                     individual.scale = scale
@@ -971,19 +1187,37 @@ class GPRun:
 
             def validation_fitness(individual):
                 scale = getattr(individual, "scale", (0.0, 1.0))
-                key = (str(individual), scale)
+                deep_out = getattr(individual, "deep_out", None)
+                if deep_out is not None:   # validation outputs already known (deep-tree mode)
+                    if getattr(individual, "val_fit", None) is None:
+                        outputs = deep_out["val"]
+                        individual.val_fit = (custom_value(outputs, val_y) if custom_fitness is not None else
+                                              _aggregate(_case_errors(outputs, val_y, metric, scale), metric))
+                    return individual.val_fit
+                key = (text_of(individual), scale)
                 if key not in val_cache:
-                    outputs = _outputs_of(toolbox.compile(expr=individual), val_X)
+                    outputs = outputs_on(individual, val_X)
                     val_cache[key] = (custom_value(outputs, val_y) if custom_fitness is not None else
                                       _aggregate(_case_errors(outputs, val_y, metric, scale), metric))
                 return val_cache[key]
 
         selector = Selector(s)
+        if problem.kind == "sr":   # fitness on a down-sample, measured like on all cases
+            targets = np.asarray(train_y, dtype=float)
+            if custom_fitness is not None:
+                selector.case_fitness = lambda ind, cases: custom_value(ind.outputs[cases], targets[cases])
+            else:
+                selector.case_fitness = lambda ind, cases: _aggregate(np.asarray(ind.errors)[cases], metric)
         toolbox.register("evaluate", evaluate)
         toolbox.register("select", selector)
-        custom = {kind: operators.from_settings(s, kind) for kind in ("crossover", "mutation", "initialization",
-                                                                      "bloat")}
+        custom = {kind: operators.from_settings(s, kind) for kind in ("initialization",)}
         op_rng = random.Random(random.getrandbits(64))   # handed to custom operators
+        # Parameters an adaptive control may change during the run (read anew in every generation,
+        # operators on every call).
+        live = {key: s[key] for key in operators.CONTROLLABLE if key in s}
+        live.update({key: operators.canonical(s[key]) for key in operators.CHOICES})
+        for key in list(operators.CONTROLLABLE) + list(operators.OPTIONS):   # settings of older versions
+            live.setdefault(key, s.get(key, config.DEFAULTS.get(key)))
 
         def as_tree(kind, name, value):
             """A custom operator's result as a valid individual."""
@@ -998,62 +1232,119 @@ class GPRun:
                 operators.fail(kind, name, "returned an incomplete tree.")
             return value if isinstance(value, creator.Individual) else creator.Individual(value)
 
-        if custom["crossover"] is not None:
-            def custom_mate(ind1, ind2, _name=custom["crossover"][0], _fn=custom["crossover"][1]):
-                result = operators.call("crossover", _name, _fn, ind1, ind2, op_rng)
-                if not isinstance(result, (tuple, list)) or len(result) != 2 or not all(
-                        isinstance(r, list) for r in result):
-                    operators.fail("crossover", _name, "must return two children.")
-                return as_tree("crossover", _name, result[0]), as_tree("crossover", _name, result[1])
-            toolbox.register("mate", custom_mate)
-        elif s.get("crossover_type") == "Leaf-biased (90/10)":
-            toolbox.register("mate", gp.cxOnePointLeafBiased, termpb=0.1)
-        else:
-            toolbox.register("mate", gp.cxOnePoint)
-        toolbox.register("expr_mut", gen_full, min_=0, max_=2)
+        mates = {}
 
-        def random_subtree(type_=None, max_depth=2):
+        def mate_for(name):
+            """The crossover operator `name` (built-in or custom), created once."""
+            if name not in mates:
+                op_ = operators.resolve(s, "crossover", name) if name not in operators.BUILTIN["crossover"] else None
+                if op_ is not None:
+                    def custom_mate(ind1, ind2, _name=op_[0], _fn=op_[1]):
+                        result = operators.call("crossover", _name, _fn, ind1, ind2, op_rng)
+                        if not isinstance(result, (tuple, list)) or len(result) != 2 or not all(
+                                isinstance(r, list) for r in result):
+                            operators.fail("crossover", _name, "must return two children.")
+                        return as_tree("crossover", _name, result[0]), as_tree("crossover", _name, result[1])
+                    mates[name] = custom_mate
+                elif operators.canonical(name) == "Leaf-biased":
+                    mates[name] = lambda ind1, ind2: gp.cxOnePointLeafBiased(
+                        ind1, ind2, termpb=1.0 - live["inner_node_probability"])
+                else:
+                    mates[name] = gp.cxOnePoint
+            return mates[name]
+
+        toolbox.register("mate", lambda ind1, ind2: mate_for(live["crossover_type"])(ind1, ind2))
+        def new_subtree(pset, type_=None):
+            """A new random subtree for a mutation, with the current depth range and method."""
+            low, high = sorted((int(live["subtree_min_depth"]), int(live["subtree_max_depth"])))
+            make = generators.get(live["subtree_method"], gen_full)
+            return make(pset, low, high, type_=type_ if type_ is not None else pset.ret)
+        toolbox.register("expr_mut", new_subtree)
+
+        def random_subtree(type_=None, max_depth=None):
+            if max_depth is None:   # as set for new subtrees
+                return new_subtree(pset, type_)
             return gen_grow(pset, 0, max(0, int(max_depth)), type_=type_ if type_ is not None else pset.ret)
         mutations = {
             "Uniform (subtree)": partial(gp.mutUniform, expr=toolbox.expr_mut, pset=pset),
             "Node replacement": partial(gp.mutNodeReplacement, pset=pset),
             "Shrink": gp.mutShrink,
-            "Ephemeral constants": partial(gp.mutEphemeral, mode="one"),
+            "Ephemeral constants": lambda ind: gp.mutEphemeral(
+                ind, mode="all" if live["ephemeral_mode"] == "All constants" else "one"),
         }
-        chosen_mutation = s.get("mutation_type", "Uniform (subtree)")
-        if custom["mutation"] is not None:
-            def custom_mutate(ind, _name=custom["mutation"][0], _fn=custom["mutation"][1]):
-                return (as_tree("mutation", _name, operators.call("mutation", _name, _fn, ind, random_subtree, op_rng)),)
-            toolbox.register("mutate", custom_mutate)
-        elif chosen_mutation == "Mixed":
-            toolbox.register("mutate", lambda ind: random.choice(list(mutations.values()))(ind))
-        else:
-            toolbox.register("mutate", mutations.get(chosen_mutation, mutations["Uniform (subtree)"]))
-        if custom["bloat"] is not None:
-            bloat_name, bloat_fn = custom["bloat"]
+        mutators = {}
 
-            def custom_limit(func):
-                """Like gp.staticLimit, with the user's rule: a rejected child is replaced by its parent."""
+        def mutate_for(name):
+            """The mutation operator `name` (built-in, "Mixed" or custom), created once."""
+            if name not in mutators:
+                op_ = operators.resolve(s, "mutation", name) if name not in operators.BUILTIN["mutation"] else None
+                if op_ is not None:
+                    def custom_mutate(ind, _name=op_[0], _fn=op_[1]):
+                        return (as_tree("mutation", _name,
+                                        operators.call("mutation", _name, _fn, ind, random_subtree, op_rng)),)
+                    mutators[name] = custom_mutate
+                elif name == "Mixed":
+                    mutators[name] = lambda ind: random.choice(list(mutations.values()))(ind)
+                else:
+                    mutators[name] = mutations.get(name, mutations["Uniform (subtree)"])
+            return mutators[name]
+
+        toolbox.register("mutate", lambda ind: mutate_for(live["mutation_type"])(ind))
+        bloat_rules = {}
+
+        def bloat_rule(func):
+            """A custom bloat control (if one is chosen at the moment): a rejected child is replaced by
+            its parent, like gp.staticLimit."""
+            def wrapper(*args, **kwargs):
+                name = live["bloat_control"]
+                if name in operators.BUILTIN["bloat"]:
+                    return func(*args, **kwargs)
+                if name not in bloat_rules:
+                    bloat_rules[name] = operators.resolve(s, "bloat", name)
+                rule_name, rule = bloat_rules[name]
+                parents = [toolbox.clone(a) for a in args]
+                children = list(func(*args, **kwargs))
+                for i, child in enumerate(children):
+                    parent = parents[min(i, len(parents) - 1)]
+                    if not operators.call("bloat", rule_name, rule, len(child), child.height, len(parent),
+                                          parent.height):
+                        children[i] = parent
+                return tuple(children)
+            return wrapper
+
+        toolbox.decorate("mate", bloat_rule)
+        toolbox.decorate("mutate", bloat_rule)
+        control_name = s.get("parameter_control", "None")
+        dynamic_depth = control_name == operators.DYNAMIC_DEPTH
+        controller = operators.from_settings(s, "control")
+        if controller is None and control_name in operators.BUILTIN_CONTROLLERS:
+            controller = (control_name, operators.BUILTIN_CONTROLLERS[control_name])
+        size_forced = {"on": False}   # an adaptive control set max_tree_size
+        size_active = lambda: live["bloat_control"] == "Depth + size limit" or size_forced["on"]
+        hard_depth = int(s["max_tree_depth"])
+        if dynamic_depth:   # Silva & Almeida (2003): starts at the initial depth, raised on demand
+            live["max_tree_depth"] = int(s["max_initial_tree_depth"])
+
+        def live_limit(key, measure, active):
+            """Like gp.staticLimit, but the limit is read from `live` on every call."""
+            def decorator(func):
                 def wrapper(*args, **kwargs):
-                    parents = [toolbox.clone(a) for a in args]
-                    children = list(func(*args, **kwargs))
-                    for i, child in enumerate(children):
-                        parent = parents[min(i, len(parents) - 1)]
-                        keep = operators.call("bloat", bloat_name, bloat_fn, len(child), child.height, len(parent),
-                                              parent.height)
-                        if not keep:
-                            children[i] = parent
-                    return tuple(children)
+                    keep = [toolbox.clone(a) for a in args]
+                    new = list(func(*args, **kwargs))
+                    if active():
+                        bound = hard_depth if (key == "max_tree_depth" and dynamic_depth) else live[key]
+                        for i, ind in enumerate(new):
+                            if measure(ind) > bound:
+                                new[i] = random.choice(keep)
+                    return tuple(new)
                 return wrapper
-            toolbox.decorate("mate", custom_limit)
-            toolbox.decorate("mutate", custom_limit)
-        limit = gp.staticLimit(key=operator.attrgetter("height"), max_value=s["max_tree_depth"])
-        toolbox.decorate("mate", limit)
-        toolbox.decorate("mutate", limit)
-        if s.get("bloat_control") == "Depth + size limit":
-            size_limit = gp.staticLimit(key=len, max_value=int(s.get("max_tree_size", 100)))
-            toolbox.decorate("mate", size_limit)
-            toolbox.decorate("mutate", size_limit)
+            return decorator
+
+        depth_limit = live_limit("max_tree_depth", operator.attrgetter("height"), lambda: True)
+        size_limit = live_limit("max_tree_size", len, size_active)
+        for name in ("mate", "mutate"):
+            toolbox.decorate(name, depth_limit)
+            toolbox.decorate(name, size_limit)
 
         if custom["initialization"] is not None:
             init_name, init_fn = custom["initialization"]
@@ -1087,7 +1378,7 @@ class GPRun:
                     fit = float(ind.fitness.values[0])
                 else:
                     fit = 100.0 * float(np.mean(np.asarray(ind.errors) == 0))
-                self._genealogy[ind.uid] = (generation, ind.op, ind.parents, fit, len(ind), str(ind))
+                self._genealogy[ind.uid] = (generation, ind.op, ind.parents, fit, len(ind), self._text_of(ind))
 
         for ind in population:
             ind.fitness.values = toolbox.evaluate(ind)
@@ -1098,16 +1389,87 @@ class GPRun:
         hof.update(population)
         if problem.kind != "sr":
             update_best(population)
-        self._record(population, hof, validation_fitness, None)
+        self._record(population, hof, validation_fitness, None)   # no parameters act on the initial population
 
-        n_elite = max(0, min(int(s.get("elitism", 0)), len(population) - 1))
-        cxpb, mutpb = s["crossover_probability"], s["mutation_probability"]
+        start_values = dict(live)
+        control_history = []
+        higher_is_better = problem.kind != "sr"
+
+        def control_state():
+            """What a parameter control sees before creating the next generation."""
+            dyn = self._records[-1]["dynamics"]
+            done, total = len(self._records), s["generations"]
+            bests = self._history["best_training"]
+            stagnation = 0
+            for k in range(len(bests) - 1, 0, -1):
+                improved = bests[k] > bests[k - 1] + 1e-12 if higher_is_better else bests[k] < bests[k - 1] - 1e-12
+                if improved:
+                    break
+                stagnation += 1
+            variation = dyn.get("variation") or {}
+
+            def better(op):
+                counts = variation.get(op)
+                return 100.0 * counts[0] / sum(counts) if counts and sum(counts) else math.nan
+            state = SimpleNamespace(
+                generation=done + 1, generations=total, progress=done / max(1, total - 1),
+                best=bests[-1], median=dyn["fitness"][2], genotypic_diversity=dyn["genotypic"],
+                phenotypic_diversity=dyn["phenotypic"], size=dyn["size"][2], depth=dyn["depth"][2],
+                selected_share=dyn["parents"] if dyn["parents"] is not None else math.nan,
+                crossover_better=better("cx"), mutation_better=better("mut"), stagnation=stagnation,
+                kind=problem.kind, start=dict(start_values), history=list(control_history))
+            control_history.append(SimpleNamespace(**{k: v for k, v in vars(state).items() if k != "history"}))
+            return state
+
+        def apply_control(changes):
+            name = controller[0]
+            if changes is None:
+                return
+            if not isinstance(changes, dict):
+                operators.fail("control", name, "must return a dict, e.g. {\"mutation_probability\": 0.2}.")
+            for key, value in changes.items():
+                if key in operators.SWITCHABLE:
+                    value = operators.canonical(value)
+                    allowed = operators.choices(s, key)
+                    if value not in allowed:
+                        operators.fail("control", name, f"{key} must be one of {', '.join(map(repr, allowed))} "
+                                                        f"(got {value!r}).")
+                    live[key] = value
+                    continue
+                if key not in operators.CONTROLLABLE:
+                    operators.fail("control", name, f"cannot change {key!r}; changeable are "
+                                                    f"{', '.join(list(operators.CONTROLLABLE) + operators.SWITCHABLE)}.")
+                lo, hi, kind_ = operators.CONTROLLABLE[key]
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    operators.fail("control", name, f"{key} must be a number (got {value!r}).")
+                if not math.isfinite(value):
+                    operators.fail("control", name, f"{key} must be finite.")
+                value = max(lo, value) if lo is not None else value
+                value = min(hi, value) if hi is not None else value
+                live[key] = int(round(value)) if kind_ is int else value
+                if key == "max_tree_size":
+                    size_forced["on"] = True
 
         for _ in range(1, s["generations"]):
             if not self._wait_for_turn():
                 return
+            if controller is not None:
+                apply_control(operators.call("control", controller[0], controller[1], control_state(), dict(live)))
+            selector.method = live["selection_method"]
+            selector.tourn_size = int(live["tourn_size"])
+            selector.parsimony_size, selector.lexicase_epsilon = live["parsimony_size"], live["lexicase_epsilon"]
+            selector.fitness_first = live["double_tournament_order"] == "Fitness first"
+            selector.downsampling = live["downsampling"]
+            selector.ds_rate, selector.outlier_rate = live["ds_rate"], live["outlier_rate"]
+            selector.parent_rate, selector.interval = live["parent_sampling_rate"], int(live["distance_interval"])
+            selector.parsimony = live["bloat_control"] == "Lexicographic parsimony"
+            cxpb, mutpb = live["crossover_probability"], live["mutation_probability"]
+            size = max(2, int(live["population_size"]))   # the next generation's size
+            n_elite = max(0, min(int(live["elitism"]), size - 1, len(population)))
             elites = [toolbox.clone(ind) for ind in tools.selBest(population, n_elite)] if n_elite else []
-            selected = toolbox.select(population, len(population) - n_elite)
+            selected = toolbox.select(population, size - n_elite)
             counts = Counter(id(ind) for ind in selected)
             extra = {"parents": 100.0 * len(counts) / max(1, len(population)),
                      "top_parent": 100.0 * max(counts.values()) / max(1, len(selected))}
@@ -1131,9 +1493,27 @@ class GPRun:
                     del offspring[i].fitness.values
                     ops[i] = "mut"
                     mutated[i] = True
-            for ind in offspring:
+            for ind, parent in zip(offspring, selected):
                 if not ind.fitness.valid:
+                    if deep_state["on"] and problem.kind == "sr":
+                        # the parent whose root it kept (incremental evaluation; evaluate() drops it again,
+                        # so copies of the individual do not drag its ancestors along)
+                        ind.parent = parent
                     ind.fitness.values = toolbox.evaluate(ind)
+            if dynamic_depth:
+                # Silva & Almeida (2003): a child deeper than the dynamic limit is kept only if it is
+                # better than the best individual so far, and then the limit rises to its depth;
+                # otherwise its parent takes its place (unchanged).
+                best_so_far = hof[0].fitness.values[0]
+                for i, child in enumerate(offspring):
+                    if child.height > live["max_tree_depth"]:
+                        if child.fitness.values[0] < best_so_far - 1e-12:
+                            live["max_tree_depth"] = child.height
+                            best_so_far = child.fitness.values[0]
+                        else:
+                            offspring[i] = toolbox.clone(selected[i])
+                            ops[i], partner[i], mutated[i] = None, None, False   # now a copy
+            extra["params"] = dict(live)
             effects = {"cx": [0, 0, 0], "mut": [0, 0, 0]}   # better, equal, worse than the parent
             for child, op, before in zip(offspring, ops, parent_fit):
                 if op:

@@ -213,19 +213,47 @@ def add_custom_program(problem):
     return problem
 
 
+def entry_of(problem):
+    """A custom problem as a plain dict (as stored in custom_problems.json and in exported
+    experiment scripts); see problem_from_entry."""
+    if getattr(problem, "dataset", False):
+        return {"kind": "dataset", "spec": problem.spec.to_dict()}
+    if problem.kind == "ps":
+        return {"kind": "ps", "code": problem.code, "inputs": problem.spec.to_dict()}
+    if problem.kind == "logic":
+        return {"kind": "logic", "code": problem.code, "name": getattr(problem, "display_name", "")}
+    return {"expression": problem.expression, "domain": list(problem.domain), "name": problem.name}
+
+
+def problem_from_entry(entry):
+    """The custom problem described by `entry` (see entry_of). Raises ValueError if it is broken."""
+    if not isinstance(entry, dict):
+        raise ValueError("A custom problem is described by a dict.")
+    try:
+        if entry.get("kind") == "dataset":
+            return datasets.build(datasets.DatasetSpec.from_dict(entry["spec"]))
+        if entry.get("kind") == "logic":
+            return synthesis.parse_logic(entry["code"], entry.get("name", ""))
+        if entry.get("kind") == "ps":
+            spec = synthesis.InputSpec.from_dict(entry.get("inputs"))
+            if "int_range" in entry:  # files written by an earlier version
+                spec.int_range = tuple(entry["int_range"])
+            return synthesis.parse_program(entry["code"], spec)
+        domain = tuple(float(v) for v in entry.get("domain", DEFAULT_DOMAIN))
+        expression, inputs = parse_expression(entry["expression"], domain)
+        return make_problem(expression, inputs, domain, name=entry.get("name", ""))
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Broken custom problem: {exc}") from exc
+
+
+def register(entry):
+    """Make the custom problem `entry` available (for this session only); returns the problem."""
+    problem = problem_from_entry(entry)
+    return REGISTRY.setdefault(problem.expression, problem)
+
+
 def save_custom():
-    data = []
-    for p in REGISTRY.values():
-        if not p.custom:
-            continue
-        if getattr(p, "dataset", False):
-            data.append({"kind": "dataset", "spec": p.spec.to_dict()})
-        elif p.kind == "ps":
-            data.append({"kind": "ps", "code": p.code, "inputs": p.spec.to_dict()})
-        elif p.kind == "logic":
-            data.append({"kind": "logic", "code": p.code, "name": getattr(p, "display_name", "")})
-        else:
-            data.append({"expression": p.expression, "domain": list(p.domain), "name": p.name})
+    data = [entry_of(p) for p in REGISTRY.values() if p.custom]
     try:
         with open(CUSTOM_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -240,36 +268,10 @@ def load_custom():
     except (OSError, ValueError):
         return
     for entry in data if isinstance(data, list) else []:
-        if isinstance(entry, dict) and entry.get("kind") == "dataset":
-            try:
-                problem = datasets.build(datasets.DatasetSpec.from_dict(entry["spec"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-            REGISTRY.setdefault(problem.expression, problem)
-            continue
-        if isinstance(entry, dict) and entry.get("kind") == "logic":
-            try:
-                problem = synthesis.parse_logic(entry["code"], entry.get("name", ""))
-            except (KeyError, TypeError, ValueError):
-                continue
-            REGISTRY.setdefault(problem.expression, problem)
-            continue
-        if isinstance(entry, dict) and entry.get("kind") == "ps":
-            try:
-                spec = synthesis.InputSpec.from_dict(entry.get("inputs"))
-                if "int_range" in entry:  # files written by an earlier version
-                    spec.int_range = tuple(entry["int_range"])
-                problem = synthesis.parse_program(entry["code"], spec)
-            except (KeyError, TypeError, ValueError):
-                continue
-            REGISTRY.setdefault(problem.expression, problem)
-            continue
         try:
-            domain = tuple(float(v) for v in entry.get("domain", DEFAULT_DOMAIN))
-            expression, inputs = parse_expression(entry["expression"], domain)
-        except (KeyError, TypeError, ValueError):
+            register(entry)
+        except ValueError:
             continue  # skip broken entries instead of failing on start
-        REGISTRY.setdefault(expression, make_problem(expression, inputs, domain, name=entry.get("name", "")))
 
 
 # --------------------------------------------------------------------------

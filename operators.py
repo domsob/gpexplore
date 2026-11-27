@@ -23,6 +23,7 @@ class Kind:
     setting: str        # config / settings key whose value names the operator
     params: tuple       # parameter names of the function
     template: str
+    label: str = ""     # short name in the dialog
 
 
 TEMPLATES = {
@@ -57,11 +58,12 @@ TEMPLATES = {
 ''',
     "mutation": '''def subtree_mutation(individual, random_subtree, rng):
     """Change one individual; return it.
-    random_subtree(type, max_depth) creates a random subtree returning `type`
-    (use the type of the node it replaces: individual[i].ret)."""
+    random_subtree(type) creates a random subtree returning `type` (use the type of
+    the node it replaces: individual[i].ret), with the depth and method set for new
+    subtrees; random_subtree(type, max_depth) grows one of at most max_depth instead."""
     i = rng.randrange(len(individual))
     s = individual.searchSubtree(i)
-    individual[s] = random_subtree(individual[i].ret, 2)
+    individual[s] = random_subtree(individual[i].ret)
     return individual
 ''',
     "initialization": '''def ramped_full(full, grow, size, min_depth, max_depth, rng):
@@ -70,6 +72,28 @@ TEMPLATES = {
     grow(depth): random tree of at most this depth."""
     depths = range(min_depth, max_depth + 1)
     return [full(depths[i % len(depths)]) for i in range(size)]
+''',
+    "control": '''def depth_schedule(state, params):
+    """Adaptive control: called before every generation; returns the parameters to change.
+    state.generation      the generation about to be created (of state.generations)
+    state.progress        0 at the start of the run, 1 at its end
+    state.best, .median   training fitness (best individual, population median)
+    state.genotypic_diversity, .phenotypic_diversity   in %
+    state.size, .depth    median tree size and depth in the population
+    state.stagnation      generations without improvement
+    state.start           the values set before the run;  params: the current values
+    Changeable (all listed in docs/custom_code.md):
+      numbers   population_size, crossover_probability, mutation_probability, tourn_size,
+                ds_rate, parent_sampling_rate, distance_interval, outlier_rate,
+                max_tree_depth, max_tree_size, elitism
+      operators selection_method, crossover_type, mutation_type, bloat_control
+                (a name, e.g. "Lexicase" or one of your saved custom operators)"""
+    # max. tree depth: grows from 6 to 17 in the first half of the run, then shrinks to 8
+    if state.progress < 0.5:
+        depth = 6 + (17 - 6) * state.progress / 0.5
+    else:
+        depth = 17 - (17 - 8) * (state.progress - 0.5) / 0.5
+    return {"max_tree_depth": round(depth)}
 ''',
     "bloat": '''def double_size_limit(child_size: int, child_depth: int, parent_size: int, parent_depth: int) -> bool:
     """Called for every child of crossover and mutation: True keeps the child,
@@ -88,18 +112,120 @@ KINDS = {k.key: k for k in (
          ("full", "grow", "size", "min_depth", "max_depth", "rng"), TEMPLATES["initialization"]),
     Kind("bloat", "Bloat control", "bloat_control", ("child_size", "child_depth", "parent_size", "parent_depth"),
          TEMPLATES["bloat"]),
+    Kind("control", "Adaptive control", "parameter_control", ("state", "params"), TEMPLATES["control"],
+         "Adaptive control"),
 )}
 
 # names of the built-in choices per kind (a custom operator must not shadow them)
 BUILTIN = {
     "fitness": ("MSE", "MAE", "RMSE", "MSE + linear scaling"),
-    "selection": ("Tournament", "Lexicase", "Epsilon-Lexicase", "DS Lexicase", "DS Epsilon-Lexicase", "IDS Lexicase",
+    "selection": ("Tournament", "Double tournament", "Roulette", "Stochastic universal sampling", "Lexicase",
+                  "Epsilon-Lexicase", "Fixed Epsilon-Lexicase", "DS Lexicase", "DS Epsilon-Lexicase", "IDS Lexicase",
                   "IDS Epsilon-Lexicase", "ROIDS", "Random", "Best", "Worst"),
-    "crossover": ("One-point", "Leaf-biased (90/10)"),
+    "crossover": ("One-point", "Leaf-biased"),
     "mutation": ("Uniform (subtree)", "Node replacement", "Shrink", "Ephemeral constants", "Mixed"),
     "initialization": ("Ramped Half-n-Half", "Full", "Grow"),
     "bloat": ("Depth limit", "Depth + size limit", "Lexicographic parsimony"),
+    "control": ("None", "Linear mutation decrease", "Diversity-triggered mutation", "Stagnation boost",
+                "Adaptive operator rates", "Dynamic depth limit (Silva & Almeida 2003)"),
 }
+DYNAMIC_DEPTH = "Dynamic depth limit (Silva & Almeida 2003)"   # needs the engine, not a function
+
+# Parameters a parameter control may change: (lowest, highest, type); values are clipped to these.
+CONTROLLABLE = {
+    "population_size": (2, None, int),
+    "crossover_probability": (0.0, 1.0, float), "mutation_probability": (0.0, 1.0, float),
+    "tourn_size": (1, None, int), "parsimony_size": (1.0, 2.0, float), "lexicase_epsilon": (0.0, None, float),
+    "ds_rate": (0.0, 1.0, float), "parent_sampling_rate": (0.0, 1.0, float),
+    "distance_interval": (1, None, int), "outlier_rate": (0.0, 1.0, float),
+    "max_tree_depth": (1, 1000, int), "max_tree_size": (1, None, int), "elitism": (0, None, int),
+    "inner_node_probability": (0.0, 1.0, float),   # leaf-biased crossover
+    "subtree_min_depth": (0, 90, int), "subtree_max_depth": (0, 90, int),   # new subtrees of mutations
+}
+# Operators an adaptive control may switch: setting -> kind. The value is the name of a built-in
+# choice or of a saved custom operator of that kind (e.g. "Lexicase" or "my_selection").
+CHOICES = {"selection_method": "selection", "crossover_type": "crossover", "mutation_type": "mutation",
+           "bloat_control": "bloat"}
+# Settings with a fixed list of values (no custom operators) an adaptive control may switch.
+OPTIONS = {"subtree_method": ("Full", "Grow", "Ramped Half-n-Half"),
+           "ephemeral_mode": ("One constant", "All constants"),
+           "double_tournament_order": ("Fitness first", "Size first"),
+           "downsampling": ("None", "Random", "Informed")}
+SWITCHABLE = list(CHOICES) + list(OPTIONS)   # everything changed by name rather than by number
+# Earlier names of built-in choices (settings files, scripts and controllers written before the rename).
+RENAMED = {"Leaf-biased (90/10)": "Leaf-biased"}
+
+
+def canonical(value):
+    """The current name of a built-in choice that was renamed."""
+    return RENAMED.get(value, value) if isinstance(value, str) else value
+
+
+def library():
+    """Code of all saved custom operators an adaptive control can switch to (stored with a run)."""
+    return {kind: dict(REGISTRY[kind]) for kind in CHOICES.values()}
+
+
+def resolve(settings, kind, name):
+    """(name, function) of the custom operator `name` of this kind in a run's settings, or None
+    for a built-in choice."""
+    code = (settings.get("custom_library") or {}).get(kind, {}).get(name)
+    if code is None and settings.get(KINDS[kind].setting) == name:
+        code = (settings.get("custom_operators") or {}).get(kind)
+    return compile_operator(kind, code) if code is not None else None
+
+
+def choices(settings, key):
+    """All values the setting `key` can be switched to in this run."""
+    if key in OPTIONS:
+        return list(OPTIONS[key])
+    kind = CHOICES[key]
+    names = list(BUILTIN[kind]) + sorted((settings.get("custom_library") or {}).get(kind, {}))
+    current = settings.get(KINDS[kind].setting)
+    if current not in names and (settings.get("custom_operators") or {}).get(kind) is not None:
+        names.append(current)
+    return names
+
+
+def _linear_mutation(state, params):
+    """Much mutation at the start (exploration), the set rate at the end."""
+    base = state.start["mutation_probability"]
+    first = min(1.0, max(0.3, 3 * base))
+    return {"mutation_probability": first + (base - first) * state.progress}
+
+
+def _diversity_mutation(state, params):
+    """More mutation while the population has converged (few different error vectors)."""
+    base = state.start["mutation_probability"]
+    return {"mutation_probability": max(base, 0.3) if state.phenotypic_diversity < 30 else base}
+
+
+def _stagnation_boost(state, params):
+    """No improvement for 5 generations: more mutation and weaker selection until it improves."""
+    start = state.start
+    if state.stagnation >= 5:
+        return {"mutation_probability": max(start["mutation_probability"], 0.3),
+                "tourn_size": max(2, start["tourn_size"] - 1)}
+    return {"mutation_probability": start["mutation_probability"], "tourn_size": start["tourn_size"]}
+
+
+def _adaptive_rates(state, params):
+    """Crossover and mutation share their total rate by how often each makes a child better than
+    its parent (credit assignment as in adaptive operator selection), smoothed over generations."""
+    if math.isnan(state.crossover_better) and math.isnan(state.mutation_better):
+        return {}
+    cx = 0.0 if math.isnan(state.crossover_better) else state.crossover_better
+    mut = 0.0 if math.isnan(state.mutation_better) else state.mutation_better
+    total = state.start["crossover_probability"] + state.start["mutation_probability"]
+    target = min(0.5, max(0.02, (mut + 1) / (cx + mut + 2) * total))
+    rate = 0.7 * params["mutation_probability"] + 0.3 * target
+    return {"mutation_probability": rate, "crossover_probability": min(1.0, max(0.1, total - rate))}
+
+
+BUILTIN_CONTROLLERS = {"Linear mutation decrease": _linear_mutation,
+                       "Diversity-triggered mutation": _diversity_mutation,
+                       "Stagnation boost": _stagnation_boost,
+                       "Adaptive operator rates": _adaptive_rates}
 
 REGISTRY = {key: {} for key in KINDS}   # kind -> {name: code}
 

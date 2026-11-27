@@ -636,7 +636,111 @@ DYNAMICS_VIEWS = {
     "selection": "Selection pressure",
     "variation": "Variation effects",
     "blocks": "Building-block usage",
+    "params": "Parameters over generations",
 }
+
+# parameters a parameter control may change (operators.CONTROLLABLE), with short axis labels
+PARAM_LABELS = {"selection_method": "selection", "crossover_type": "crossover op.",
+                "mutation_type": "mutation op.", "bloat_control": "bloat control", "population_size": "population",
+                "crossover_probability": "crossover", "mutation_probability": "mutation",
+                "tourn_size": "tourn. size", "parsimony_size": "parsimony size",
+                "double_tournament_order": "tourn. order", "lexicase_epsilon": "fixed ε", "downsampling": "down-sampling", "ds_rate": "down-sample", "parent_sampling_rate": "parent sampl.",
+                "distance_interval": "dist. interval", "outlier_rate": "outlier γ",
+                "max_tree_depth": "max. depth", "max_tree_size": "max. size", "elitism": "elitism",
+                "inner_node_probability": "inner nodes", "subtree_min_depth": "subtree min.",
+                "subtree_max_depth": "subtree max.", "subtree_method": "subtree method",
+                "ephemeral_mode": "ephemeral"}
+PARAM_INTEGER = {"population_size", "tourn_size", "distance_interval", "max_tree_depth", "max_tree_size", "elitism",
+                 "subtree_min_depth", "subtree_max_depth"}
+PARAM_CHOICES = {"selection_method", "crossover_type", "mutation_type", "bloat_control", "subtree_method",
+                 "ephemeral_mode", "double_tournament_order", "downsampling"}   # names, not numbers
+MAX_PARAM_PANELS = 5
+
+
+def _stacked_axes(fig, n, size, left_margin=MARGIN_LEFT_FIT):
+    """n panels above each other with a shared x axis (instead of several y axes)."""
+    width, height = max(int(size[0]), 240), max(int(size[1]), 180)
+    left, right = left_margin / width, 1 - MARGIN_RIGHT / width
+    top, bottom = 1 - MARGIN_TOP / height, MARGIN_BOTTOM / height
+    gap = 18 / height
+    h = (top - bottom - gap * (n - 1)) / n
+    axes = []
+    for k in range(n):
+        y = top - (k + 1) * h - k * gap
+        ax = fig.add_axes((left, y, right - left, h), sharex=axes[0] if axes else None)
+        ax.set_facecolor(_panel())
+        ax.set_axisbelow(True)
+        axes.append(ax)
+    for ax in axes[:-1]:
+        ax.tick_params(labelbottom=False)
+    axes[-1].xaxis.set_major_locator(MaxNLocator(nbins=6, integer=True, min_n_ticks=2))
+    axes[-1].set_xlabel("Generation")
+    return axes
+
+
+def _no_parameter_changed(fig, generations):
+    ax = fig.axes[0] if fig.axes else fig.add_axes((0.1, 0.15, 0.85, 0.8))
+    ax.set_xlim(1, max(generations, 2))
+    ax.set_yticks([])
+    ax.text(0.5, 0.5, "No parameter changed during the run\n(Advanced settings → Adaptive control)",
+            transform=ax.transAxes, ha="center", va="center", fontsize=10, color=style.INK)
+
+
+def _choice_values(values, categories):
+    """Names as positions on the y axis (categories: the names in order of first use)."""
+    for v in values:
+        if v and v not in categories:
+            categories.append(v)
+    return np.array([categories.index(v) if v else np.nan for v in values], dtype=float)
+
+
+CHOICE_MARGIN = 118   # left margin (pixels) when a panel shows operator names
+
+
+def _choice_axis(ax, categories):
+    ax.set_yticks(range(len(categories)))
+    ax.set_yticklabels([_short_label(c, 18) for c in categories], fontsize=7.5)
+    ax.set_ylim(-0.5, len(categories) - 0.5)
+    ax.grid(axis="y", visible=False)
+
+
+def _param_axis(ax, key):
+    if key in PARAM_CHOICES:   # the names take the room of a y label: the label goes inside the panel
+        ax.text(0.005, 0.97, PARAM_LABELS.get(key, key), transform=ax.transAxes, ha="left", va="top",
+                fontsize=8, color=style.MUTED)
+        return
+    if key in PARAM_INTEGER:
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4, integer=True))
+    else:
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+    ax.set_ylabel(PARAM_LABELS.get(key, key), labelpad=2)
+
+
+def _render_params(dyn, xs, generations, size):
+    """Values of the parameters a parameter control changed, one panel per parameter."""
+    series = {key: [(d.get("params") or {}).get(key) for d in dyn] for key in PARAM_LABELS}
+    changed = [key for key, values in series.items() if len({v for v in values if v is not None}) > 1]
+    width, height = max(int(size[0]), 240), max(int(size[1]), 180)
+    fig = Figure(figsize=(width / 100, height / 100), dpi=100, facecolor=_panel())
+    if not changed:
+        axes = _stacked_axes(fig, 1, size)
+        _no_parameter_changed(fig, generations)
+        return _png(fig)
+    keys = changed[:MAX_PARAM_PANELS]
+    axes = _stacked_axes(fig, len(keys), size,
+                         CHOICE_MARGIN if PARAM_CHOICES & set(keys) else MARGIN_LEFT_FIT)
+    for ax, key in zip(axes, keys):
+        if key in PARAM_CHOICES:
+            categories = []
+            values = _choice_values(series[key], categories)
+            ax.plot(xs, values, color=style.ACCENT, linewidth=1.8, drawstyle="steps-post")
+            _choice_axis(ax, categories)
+        else:
+            values = np.array([np.nan if v is None else v for v in series[key]], dtype=float)
+            ax.plot(xs, values, color=style.ACCENT, linewidth=1.8, drawstyle="steps-post")
+        _param_axis(ax, key)
+    axes[0].set_xlim(1, max(generations, 2))
+    return _png(fig)
 
 
 def _percent_axis(ax):
@@ -664,6 +768,8 @@ def render_dynamics(view, snapshot, generations, size=DEFAULT_SIZE, kind="sr"):
         xs = np.arange(1, len(dyn) + 1)
         if view == "size":
             return _render_size(dyn, xs, generations, size)
+        if view == "params":
+            return _render_params(dyn, xs, generations, size)
         fig, ax = _figure(*size, MARGIN_LEFT_FIT)
         ax.set_xlim(1, max(generations, 2))
         ax.xaxis.set_major_locator(MaxNLocator(nbins=6, integer=True, min_n_ticks=2))
@@ -910,6 +1016,7 @@ EXPERIMENT_DYNAMICS_TITLES = {
     "selection": "Selection: selected at least once, top parent",
     "variation": "Variation: children better than their parent",
     "blocks": "Building-block usage (mean over generations and runs)",
+    "params": "Parameters over generations (adaptive control)",
 }
 
 
@@ -920,17 +1027,46 @@ def render_experiment_dynamics(view, groups, labels, kind, generations, size=DEF
             return _render_experiment_blocks(groups, labels, size)
         width, height = max(int(size[0]), 240), max(int(size[1]), 180)
         fig = Figure(figsize=(width / 100, height / 100), dpi=100, facecolor=_panel())
-        left, right = MARGIN_LEFT_FIT / width, 1 - MARGIN_RIGHT / width
-        top, bottom = 1 - MARGIN_TOP / height, MARGIN_BOTTOM / height
-        gap = 18 / height
-        mid = bottom + (top - bottom - gap) / 2
-        ax1 = fig.add_axes((left, mid + gap, right - left, top - mid - gap))
-        ax2 = fig.add_axes((left, bottom, right - left, mid - bottom), sharex=ax1)
+        if view == "params":   # the parameters some run changed, one panel each
+            keys = []
+            for key in PARAM_LABELS:
+                for g in groups:
+                    for r in g:
+                        values = experiments.run_series(r).get(f"param_{key}", [])
+                        distinct = {v for v in values if v not in ("", None) and not (isinstance(v, float)
+                                                                                      and math.isnan(v))}
+                        if len(distinct) > 1 and key not in keys:
+                            keys.append(key)
+            if not keys:
+                _stacked_axes(fig, 1, size)
+                _no_parameter_changed(fig, generations)
+                return _png(fig)
+            panels = [(f"param_{key}", key) for key in keys[:MAX_PARAM_PANELS]]
+        else:
+            panels = EXPERIMENT_DYNAMICS[view]
+        choice_panel = view == "params" and any(name in PARAM_CHOICES for _, name in panels)
+        axes = _stacked_axes(fig, len(panels), size, CHOICE_MARGIN if choice_panel else MARGIN_LEFT_FIT)
+        ax1 = axes[0]
         percent = view in ("diversity", "selection", "variation") or (view == "fitness" and kind != "sr")
         log = view == "fitness" and kind == "sr"
-        for ax, (column, name) in zip((ax1, ax2), EXPERIMENT_DYNAMICS[view]):
-            ax.set_facecolor(_panel())
-            ax.set_axisbelow(True)
+        for ax, (column, name) in zip(axes, panels):
+            if view == "params" and name in PARAM_CHOICES:
+                # names: per configuration the operator most runs use in each generation
+                categories = []
+                for i, (g, label) in enumerate(zip(groups, labels)):
+                    runs = [experiments.run_series(r)[column] for r in g]
+                    if not runs:
+                        continue
+                    mode = []
+                    for gi in range(generations):
+                        used = [run[gi] for run in runs if gi < len(run) and run[gi]]
+                        mode.append(Counter(used).most_common(1)[0][0] if used else "")
+                    ax.plot(np.arange(1, generations + 1), _choice_values(mode, categories),
+                            color=style.CATEGORICAL[i % len(style.CATEGORICAL)], linewidth=1.8,
+                            drawstyle="steps-post", label=_short_label(label, 28))
+                _choice_axis(ax, categories or [""])
+                _param_axis(ax, name)
+                continue
             values = []
             for i, (g, label) in enumerate(zip(groups, labels)):
                 rows = experiments.series_matrix(g, column, generations)
@@ -943,8 +1079,12 @@ def render_experiment_dynamics(view, groups, labels, kind, generations, size=DEF
                 with np.errstate(all="ignore"), warnings_ignored():
                     q1, med, q3 = np.nanpercentile(rows, [25, 50, 75], axis=0)
                 values.extend(rows[np.isfinite(rows)])
-                ax.fill_between(xs, q1, q3, color=color, alpha=0.16, linewidth=0)
-                ax.plot(xs, med, color=color, linewidth=1.8, label=_short_label(label, 28))
+                steps = "steps-post" if view == "params" else "default"   # parameters change in steps
+                ax.fill_between(xs, q1, q3, color=color, alpha=0.16, linewidth=0, step="post" if view == "params" else None)
+                ax.plot(xs, med, color=color, linewidth=1.8, label=_short_label(label, 28), drawstyle=steps)
+            if view == "params":
+                _param_axis(ax, name)
+                continue
             if log:
                 _floor_axis(ax, values)
             elif percent:
@@ -956,9 +1096,6 @@ def render_experiment_dynamics(view, groups, labels, kind, generations, size=DEF
         if ax1.get_legend_handles_labels()[0]:
             _style_legend(ax1, "lower right" if view == "fitness" and kind != "sr" else "best")
         ax1.set_xlim(1, max(generations, 2))
-        ax1.tick_params(labelbottom=False)
-        ax2.xaxis.set_major_locator(MaxNLocator(nbins=6, integer=True, min_n_ticks=2))
-        ax2.set_xlabel("Generation")
         return _png(fig)
 
 
@@ -1007,6 +1144,8 @@ EXPERIMENT_CAPTIONS = {
     "variation": "Share of crossover children (top) and mutation children (bottom) that are better than their "
                  "parent; median over the runs, band: IQR.",
     "blocks": "Share of all nodes in the population per building block, averaged over all generations and runs.",
+    "params": "Values of the parameters changed by the adaptive control in each generation; line: median over "
+              "the runs, band: IQR (operators: the one most runs use).",
 }
 REPORT_SIZE = (11.69, 8.27)   # A4 landscape, inches
 REPORT_PLOT = (514, 282)      # one plot, 1 px = 1/100 inch: its size on the page (fonts at their real size)
@@ -1040,6 +1179,32 @@ def _report_plots(kind, groups, labels, generations):
         out.append((EXPERIMENT_DYNAMICS_TITLES[view], EXPERIMENT_CAPTIONS[view],
                     render_experiment_dynamics(view, groups, labels, kind, generations, REPORT_PLOT)))
     return out
+
+
+ZIP_PLOT = (800, 480)   # pixels at 100 dpi, i.e. 8 x 4.8 inches
+
+
+def experiment_plots_zip(sets, labels, generations):
+    """ZIP with every experiment plot of every problem as PNG (300 dpi) and PDF (vector), white
+    background as in the report. sets: list of (problem name, kind, groups)."""
+    import re
+    import zipfile
+    views = [("final", None), ("convergence", None)] + [(v, v) for v in DYNAMICS_VIEWS]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, kind, groups in sets:
+            folder = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-")[:40] or "problem"
+            for k, (key, view) in enumerate(views, 1):
+                for fmt in ("png", "pdf"):
+                    with print_style(scale=3), output_format(fmt):
+                        if key == "final":
+                            data = render_experiment_final(groups, labels, kind, ZIP_PLOT)
+                        elif key == "convergence":
+                            data = render_experiment_convergence(groups, labels, kind, generations, ZIP_PLOT)
+                        else:
+                            data = render_experiment_dynamics(view, groups, labels, kind, generations, ZIP_PLOT)
+                    zf.writestr(f"{folder}/{k:02d}_{key}.{fmt}", data)
+    return buf.getvalue()
 
 
 def render_experiment_report(overview, sections):
@@ -1215,24 +1380,28 @@ def _layout(nodes):
     """Tidy layout of a prefix-ordered tree: leaves get consecutive x slots,
     every parent sits centred above its children."""
     pos, edges = {}, []
-    next_leaf = [0]
-
-    def place(i, depth):
-        _, arity, _ = nodes[i]
-        if arity == 0:
-            pos[i] = (next_leaf[0], depth)
-            next_leaf[0] += 1
-            return i + 1
-        children, j = [], i + 1
-        for _ in range(arity):
-            children.append(j)
-            j = place(j, depth + 1)
-        pos[i] = (sum(pos[c][0] for c in children) / len(children), depth)
-        edges.extend((i, c) for c in children)
-        return j
-
-    place(0, 0)
-    return pos, edges, next_leaf[0], max(d for _, d in pos.values())
+    next_leaf = 0
+    open_nodes = []   # [index, depth, children so far] of the inner nodes not complete yet
+    for i, (_, arity, _) in enumerate(nodes):   # prefix order, without recursion (deep trees)
+        depth = len(open_nodes)
+        if arity:
+            open_nodes.append([i, depth, []])
+            continue
+        pos[i] = (next_leaf, depth)
+        next_leaf += 1
+        done = i
+        while open_nodes:   # parents whose last child is now placed sit centred above them
+            open_nodes[-1][2].append(done)
+            parent, p_depth, children = open_nodes[-1]
+            if len(children) < nodes[parent][1]:
+                break
+            open_nodes.pop()
+            pos[parent] = (sum(pos[c][0] for c in children) / len(children), p_depth)
+            edges.extend((parent, c) for c in children)
+            done = parent
+        if not open_nodes and len(pos) == len(nodes):
+            break
+    return pos, edges, next_leaf, max(d for _, d in pos.values())
 
 
 def render_tree(nodes):

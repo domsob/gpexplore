@@ -8,10 +8,11 @@ GPExplore is a desktop (and web) application for exploring and teaching genetic 
 
 - **Problems**: Regression benchmarks (Koza, Nguyen, Pagie, …), program synthesis (Small or Large, Compare String Lengths, Count Odds), Boolean problems (parity, multiplexer, majority), plus your own: a formula, a Python function, a Boolean expression or an imported data set (CSV, TSV, …).
 - **Runs**: Watch evolution as it happens. While a run makes progress, GPExplore shows how the error drops, how the best individual fits the data and which test cases it solves. You can check its tree representation and ancestry, browse the whole population, or switch to the population dynamics: fitness distribution, tree size, diversity, selection pressure and the effects of crossover and mutation.
-- **Selection**: Tournament, (ε-)lexicase, down-sampled and informed down-sampled (ε-)lexicase, ROIDS, and more.
-- **Parameters**: Everything from population size to crossover type, mutation operator, bloat control, elitism, fitness function and seed.
-- **Your own code**: Custom fitness functions, selection methods, crossover and mutation operators, initialization and bloat control, as well as custom functions for each function set, all written as Python functions in the app (with syntax highlighting).
-- **Experiments**: Compare configurations over many runs with full parallelization. Success rates, median curves, and population dynamics can be analyzed over all runs. The results can bye also exported as PDF report and CSV.
+- **Selection**: Tournament, double tournament, roulette wheel, stochastic universal sampling, (ε-)lexicase, down-sampled and informed down-sampled (ε-)lexicase, ROIDS, and more.
+- **Parameters**: Everything from population size to crossover type, mutation operator, bloat control, elitism, fitness function and seed. With adaptive control, values can also change during a run.
+- **Your own code**: Custom fitness functions, selection methods, crossover and mutation operators, initialization, bloat control and adaptive control, as well as custom functions for each function set, all written as Python functions in the app (with syntax highlighting). What each of them receives and returns: [docs/custom_code.md](docs/custom_code.md).
+- **Speed**: With numba, regression trees are evaluated and lexicase selection runs as compiled code, with the same results as without (Additional Parameters → *Numba acceleration*, `numba_acceleration=False` in Python to compare). For symbolic regression, trees are evaluated on all test cases at once and children incrementally from the changed subtree upwards (Langdon & Banzhaf, 2022).
+- **Experiments**: Compare configurations over many runs with full parallelization. Success rates, median curves, and population dynamics can be analyzed over all runs. The results can also be exported, e.g. as PDF or CSV. You can even export your settings as *Python script* to run the experiment without the app and the GUI (e.g. on a server).
 
 ## Getting Started
 
@@ -31,7 +32,7 @@ The first start downloads the Flet desktop client once. On Linux you may also ne
 
 ## Use GPExplore in Python
 
-`gpexplore.py` performs the same runs and experiments as the app. Problems, data sets and custom operators are addressed by the names shown in the app. Parameter names can be listed by `gpx.parameters()`.
+`gpexplore.py` gives the same runs and experiments as the app. Problems, data sets and custom operators are addressed by the names shown in the app; parameter names are listed by `gpx.parameters()`.
 
 ```python
 import gpexplore as gpx
@@ -51,11 +52,12 @@ if __name__ == "__main__":      # needed because experiments run in several proc
     exp.run()
     print(exp.summary())                           # medians, success rates, pairwise tests
     exp.to_pdf("report.pdf")
+    exp.to_zip("plots.zip")                        # every plot as PNG and PDF
     exp.to_csv("results.csv")                      # aggregated per generation
     exp.to_csv("runs.csv", raw=True)               # every value of every run
 ```
 
-`gpx.problem_names()` lists all problems, `gpx.gui_settings()` returns the parameters last used in the app (use it as `base=` of `run` or `Experiment`).
+`gpx.problem_names()` lists all problems, `gpx.gui_settings()` returns the parameters last used in the app (use it as `base=` of `run` or `Experiment`). `gpx.use_problem`, `gpx.use_operator` and `gpx.use_function` make further custom problems, operators and functions available for one script, as in the scripts exported from the Experiments tab.
 
 ## License
 

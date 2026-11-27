@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy import stats
 
+import operators
+
 
 def cpu_cores():
     try:
@@ -33,6 +35,8 @@ def run_one(job):
     import gp          # imported in the worker process
     import problems
     settings = dict(settings)
+    if key not in problems.REGISTRY and settings.get("problem_entry"):
+        problems.register(settings["problem_entry"])   # a custom problem the worker does not know
     settings["problem"] = problems.get(key)
     settings["seed"] = seed
     started = time.time()
@@ -76,7 +80,9 @@ SERIES_COLUMNS = (
     + [f"depth_{q}" for q in QUANTILES] + ["depth_max"]
     + ["genotypic_diversity", "phenotypic_diversity", "selected_at_least_once", "most_selected_share"]
     + [f"{op}_{effect}" for op in ("crossover", "mutation") for effect in ("better", "equal", "worse")]
+    + [f"param_{key}" for key in operators.SWITCHABLE + list(operators.CONTROLLABLE)]
 )
+CHOICE_COLUMNS = {f"param_{key}" for key in operators.SWITCHABLE}   # names (text), not numbers
 CARRIED = ("best_training", "best_validation")   # the best found so far stays when a run ends early
 
 
@@ -110,6 +116,11 @@ def run_series(r):
     for op, name in (("cx", "crossover"), ("mut", "mutation")):
         for k, effect in enumerate(("better", "equal", "worse")):
             s[f"{name}_{effect}"] = [_effect_share((d["variation"] or {}).get(op), k) for d in dyn]
+    for column in SERIES_COLUMNS:   # parameter values in each generation (adaptive control)
+        if column in CHOICE_COLUMNS:
+            s[column] = [(d.get("params") or {}).get(column[6:]) or "" for d in dyn]
+        elif column.startswith("param_"):
+            s[column] = [_f((d.get("params") or {}).get(column[6:])) for d in dyn]
     names = set()
     for d in dyn:
         names.update(d["blocks"])
@@ -374,6 +385,14 @@ def to_csv_aggregated(sets, labels):
         columns = SERIES_COLUMNS + [f"block_{b}" for b in block_names(groups)]
         for label, g in zip(labels, groups):
             for column in columns:
+                if column in CHOICE_COLUMNS:   # share of the runs using each operator, per generation
+                    for gi in range(length):
+                        values = [run_series(r)[column][gi] for r in g if gi < len(run_series(r)[column])]
+                        values = [v for v in values if v]
+                        for value in sorted(set(values)):
+                            w.writerow([problem, label, f"{column}={value}", gi + 1, len(values), "", "", "",
+                                        _cell(100.0 * values.count(value) / len(values)), "", "", "", "", ""])
+                    continue
                 m = series_matrix(g, column, length)
                 for gi in range(length):
                     v = m[:, gi] if len(m) else np.empty(0)
@@ -397,3 +416,156 @@ def to_csv_aggregated(sets, labels):
                     w.writerow([problem, label, "success_rate", gi + 1, n, "", "", "", _cell(100 * rate), "", "",
                                 "", _cell(100 * lo), _cell(100 * hi)])
     return buf.getvalue().encode("utf-8")
+
+
+# --------------------------------------------------------------------------
+# Export as a Python script (runs the batch without the app, e.g. on a server)
+# --------------------------------------------------------------------------
+
+def _literal(code):
+    """Python code as a readable string literal."""
+    if "'''" not in code and not code.endswith("\\"):
+        return "r'''" + code + "'''"
+    return repr(code)
+
+
+def python_script(configs, problem_keys, runs, seed, file_stem="experiment"):
+    """A Python script that runs this experiment with gpexplore's API: same configurations,
+    problems, runs and seeds, hence the same results as in the app. `configs` are the app's
+    configurations (label, settings, problem, sizes). Custom problems, operators and functions
+    are embedded, so the script needs only the GPExplore code."""
+    import datetime
+    import json
+    import config
+    import gpexplore as gpx
+    import problems
+
+    origins = [c["problem"] for c in configs]
+    keys = list(dict.fromkeys(list(problem_keys) + origins))
+
+    def name_of(key):
+        p = problems.get(key)
+        title = problems.title(p)
+        try:
+            return title if gpx.find_problem(title) is p else key
+        except KeyError:
+            return key
+
+    custom_problems = [problems.entry_of(problems.get(k)) for k in keys if problems.get(k).custom]
+    used_operators, used_functions = {}, {}
+    for c in configs:
+        s = c["settings"]
+        for kind, code in (s.get("custom_operators") or {}).items():
+            used_operators[(kind, operators.check(kind, code))] = code
+        for kind, library in (s.get("custom_library") or {}).items():
+            for name, code in library.items():
+                used_operators.setdefault((kind, name), code)
+        for area, codes in (s.get("custom_functions") or {}).items():
+            for code in codes:
+                used_functions[(area, operators.check_function(area, code)[0])] = code
+
+    allowed = set(gpx.parameters()) - {"seed"}
+    lines = []
+    for c in configs:
+        s = c["settings"]
+        train, val, noise, outliers = c["sizes"]
+        values = dict(s, training_set_size=train, validation_set_size=val, noise_intensity=noise,
+                      outlier_share=outliers)
+        baseline = gpx.settings(c["problem"], data_seed=seed)
+        # differences from the defaults (they also apply on other problems) and from what the
+        # problem sets itself (e.g. a building block switched off)
+        params = {k: values[k] for k in sorted(allowed) if k in values
+                  and (values[k] != config.DEFAULTS.get(k) or values[k] != baseline.get(k))}
+        args = [repr(c["label"]), f"problem={name_of(c['problem'])!r}"]
+        if used_functions:
+            names = [operators.check_function(area, code)[0]
+                     for area, codes in (s.get("custom_functions") or {}).items() for code in codes]
+            args.append(f"functions={names!r}")
+        args += [f"{k}={v!r}" for k, v in params.items()]
+        lines.append("    exp.add(" + (",\n            ".join(args)) + ")")
+
+    out = [
+        '"""' + f"GPExplore experiment, exported from the app on {datetime.datetime.now():%Y-%m-%d %H:%M} "
+        f"({config.APP_NAME} {config.APP_VERSION}).",
+        "",
+        "Runs the same configurations, problems, runs and seeds as in the app, without the app (e.g. on a",
+        "server), and gives the same results. Put it into the GPExplore folder, or set GPEXPLORE_DIR to",
+        "that folder, then:",
+        "",
+        f"    python {file_stem}.py            # all CPU cores but one",
+        f"    python {file_stem}.py 32         # 32 runs in parallel",
+        "",
+        f"Results: the summary on screen and in the folder {file_stem}_results next to this file",
+        "(PDF report, all plots as ZIP, aggregated and raw CSV).",
+        '"""',
+        "",
+        "import json",
+        "import os",
+        "import sys",
+        "import time",
+        "",
+        "HERE = os.path.dirname(os.path.abspath(__file__))",
+        'sys.path.insert(0, os.environ.get("GPEXPLORE_DIR", HERE))',
+        "",
+        "import gpexplore as gpx  # noqa: E402",
+        "",
+        "",
+        "def duration(seconds):",
+        "    seconds = int(round(seconds))",
+        '    return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"',
+        "",
+        "",
+        "def show_progress(done, total, seconds):",
+        '    """In a terminal a bar that updates in place; in a log file (e.g. with nohup) one line',
+        '    about every 5 % of the runs."""',
+        "    share = done / total",
+        '    text = f"{done} / {total} runs ({share:.0%}) | {duration(seconds)} elapsed"',
+        "    if done:",
+        '        text += f" | about {duration(seconds / done * (total - done))} left"',
+        "    if sys.stderr.isatty():",
+        "        filled = int(30 * share)",
+        '        full, empty = ("\\u2588", "\\u2591") if "utf" in (sys.stderr.encoding or "").lower() else ("#", "-")',
+        "        bar = full * filled + empty * (30 - filled)",
+        '        print(f"\\r{bar}  {text}", end="\\n" if done == total else "", file=sys.stderr, flush=True)',
+        "    elif done == total or done % max(1, total // 20) == 0:",
+        '        print(f"{time.strftime(\'%H:%M:%S\')}  {text}", file=sys.stderr, flush=True)',
+        "",
+        "",
+    ]
+    if custom_problems:
+        out += ["# custom problems of this experiment (available only while the script runs)",
+                f"PROBLEMS = json.loads({json.dumps(custom_problems)!r})", ""]
+    if used_operators:
+        out += ["# custom operators (kind, code)", "OPERATORS = ["]
+        out += [f"    ({kind!r}, {_literal(code)})," for (kind, _), code in used_operators.items()]
+        out += ["]", ""]
+    if used_functions:
+        out += ["# custom functions (area, code)", "FUNCTIONS = ["]
+        out += [f"    ({area!r}, {_literal(code)})," for (area, _), code in used_functions.items()]
+        out += ["]", ""]
+    out += ['if __name__ == "__main__":   # needed: the runs happen in several processes']
+    if custom_problems:
+        out += ["    for entry in PROBLEMS:", "        gpx.use_problem(entry)"]
+    if used_operators:
+        out += ["    for kind, code in OPERATORS:", "        gpx.use_operator(kind, code)"]
+    if used_functions:
+        out += ["    for area, code in FUNCTIONS:", "        gpx.use_function(area, code)"]
+    out += ["    workers = int(sys.argv[1]) if len(sys.argv) > 1 else None",
+            f"    exp = gpx.Experiment({[name_of(k) for k in problem_keys]!r}, runs={int(runs)}, seed={int(seed)},"
+            " workers=workers)"]
+    out += lines
+    out += ["    total = len(exp.problems) * len(exp.configs) * exp.runs",
+            '    print(f"{total} runs: {len(exp.configs)} configuration(s) x {len(exp.problems)} problem(s) x "',
+            '          f"{exp.runs} runs, {exp.workers} in parallel", file=sys.stderr, flush=True)',
+            "    exp.run(progress=show_progress)",
+            "    print(exp.summary())",
+            f"    results = os.path.join(HERE, {file_stem + '_results'!r})",
+            "    os.makedirs(results, exist_ok=True)",
+            '    for what, write in (("PDF report", lambda: exp.to_pdf(os.path.join(results, "report.pdf"))),',
+            '                        ("plots (ZIP)", lambda: exp.to_zip(os.path.join(results, "plots.zip"))),',
+            '                        ("aggregated CSV", lambda: exp.to_csv(os.path.join(results, "aggregated.csv"))),',
+            '                        ("raw CSV", lambda: exp.to_csv(os.path.join(results, "raw.csv"), raw=True))):',
+            '        print(f"Writing {what} ...", file=sys.stderr, flush=True)',
+            "        write()",
+            '    print("Results in", results)', ""]
+    return "\n".join(out)
